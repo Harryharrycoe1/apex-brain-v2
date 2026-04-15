@@ -6,23 +6,21 @@ import { getCortexSections } from "../../data/cortex.js";
 import { AMYGDALA_PROMPT } from "../../data/amygdala.js";
 import { DEFAULT_STATE } from "../../data/fundState.js";
 import { WATCHLIST, PENCE_SYMBOLS } from "../../data/algoConfig.js";
+import { runAlgoEngine } from "../../lib/algoInline.js";
 
 export const maxDuration = 120;
 const API_KEY = process.env.ANTHROPIC_API_KEY;
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 function $(v, d = 2) { const n = Number(v); return isFinite(n) ? n.toFixed(d) : "—"; }
 
-// ═══ DIRECTION-AWARE P&L ═══
-function plPerUnit(entry, current, direction) {
-  const dir = (direction || "buy").toLowerCase();
+function plPerUnit(entry, current, dir) {
   return (dir === "short" || dir === "sell") ? entry - current : current - entry;
 }
 
-// ═══ FAST PATH — zero API cost ═══
+// ═══ FAST PATH ═══
 function tryFastPath(userMsg, state, prices) {
   const l = userMsg.toLowerCase().trim();
   const p = prices || {};
-  // Price query
   const tm = l.match(/(?:what(?:'s| is)|price (?:of|for)|how (?:much )?is)\s+(\w+)/);
   const jt = l.match(/^(\w{1,5})(?:\s*(?:price|\?)?\s*)$/i);
   const ticker = (tm?.[1] || jt?.[1] || "").toUpperCase();
@@ -30,12 +28,10 @@ function tryFastPath(userMsg, state, prices) {
     const c = ["IAG","BAE"].includes(ticker) ? "£" : "$";
     return { content: `**${ticker}:** ${c}${$(p[ticker].price)} (${p[ticker].changePct >= 0 ? "+" : ""}${p[ticker].changePct}% today)`, pathway: "fast_path" };
   }
-  // NAV
   if (l.match(/^(?:what(?:'s| is) (?:my |the )?)?(?:nav|account|balance)/)) {
     const a = state?.account;
     if (a) return { content: `**NAV:** £${$(a.nav)} | **Cash:** £${$(a.cash)} | **Margin:** £${$(a.margin_used)} | **Health:** ${a.margin_health_pct}%\n**Deposited:** £${a.total_deposited} | **Realised:** +£${$(a.total_realised_pl)}`, pathway: "fast_path" };
   }
-  // Positions
   if (l.match(/^(?:what(?:'s| are) (?:my |the )?)?(?:positions?|book|holdings?)/)) {
     const pos = state?.positions || [];
     if (pos.length) {
@@ -49,7 +45,6 @@ function tryFastPath(userMsg, state, prices) {
       return { content: `**${pos.length} open positions:**\n${lines.join("\n")}`, pathway: "fast_path" };
     }
   }
-  // Peace score
   if (l.match(/(?:peace|signal).*(?:score|status)/)) {
     const s = state?.signals;
     if (s) return { content: `**Peace Signal Score:** ${s.total}/8 (trigger ≥${s.trigger}) — ${s.total >= s.trigger ? "EXIT SEQUENCE ARMED" : "Below trigger"}`, pathway: "fast_path" };
@@ -93,7 +88,7 @@ async function kvGet(key) {
   } catch { return null; }
 }
 
-// ═══ YAHOO PRICES (direct — no self-call) ═══
+// ═══ YAHOO PRICES (direct) ═══
 async function fetchYahooPrice(symbol) {
   try {
     const r = await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=2d`, { headers: { "User-Agent": "Mozilla/5.0" } });
@@ -111,7 +106,6 @@ async function fetchYahooPrice(symbol) {
 
 async function loadPrices(positions = []) {
   const tickers = { BRENT: "BZ=F", WTI: "CL=F", SPX: "^GSPC", VIX: "^VIX", GBPUSD: "GBPUSD=X" };
-  // Dynamically add ALL held position tickers
   for (const pos of positions) {
     const id = pos.id?.toUpperCase();
     if (id && WATCHLIST[id]) tickers[id] = WATCHLIST[id].yahoo;
@@ -126,10 +120,20 @@ async function loadPrices(positions = []) {
   return results;
 }
 
+// ═══ LOAD LEARNING DATA ═══
+async function loadLearningData() {
+  const knowledge = await kvGet("apex:knowledge") || [];
+  const fresh = knowledge.filter(k => {
+    const age = (Date.now() - new Date(k.stored_at || k.date).getTime()) / 86400000;
+    return age < 7;
+  });
+  return { knowledge: fresh };
+}
+
 // ═══ FORMAT FUND CONTEXT ═══
-function formatContext(state, prices, clientPrices) {
+function formatContext(state, prices, clientPrices, algoOutput, learningData) {
   if (!state) return "";
-  const p = { ...prices, ...(clientPrices || {}) }; // Client prices override server
+  const p = { ...prices, ...(clientPrices || {}) };
   const a = state.account;
   const gbp = Number(a?.gbp_usd) || 1.34;
   const lines = ["\n=== LIVE FUND STATE ==="];
@@ -140,7 +144,6 @@ function formatContext(state, prices, clientPrices) {
     lines.push(`Fund Day ${Math.floor((Date.now() - new Date(a.inception_date).getTime()) / 86400000)}`);
   }
 
-  // Macro prices
   const macro = [];
   if (p.BRENT?.price) macro.push(`Brent: $${$(p.BRENT.price)} (${p.BRENT.changePct >= 0 ? "+" : ""}${p.BRENT.changePct}%)`);
   if (p.SPX?.price) macro.push(`S&P: ${$(p.SPX.price, 0)}`);
@@ -148,7 +151,6 @@ function formatContext(state, prices, clientPrices) {
   if (p.GBPUSD?.price) macro.push(`GBP/USD: ${$(p.GBPUSD.price, 4)}`);
   if (macro.length) lines.push(`MACRO: ${macro.join(" | ")}`);
 
-  // Positions with P&L
   if (state.positions?.length) {
     lines.push(`\nOPEN POSITIONS (${state.positions.length}/10):`);
     let totalPL = 0;
@@ -176,6 +178,19 @@ function formatContext(state, prices, clientPrices) {
   if (state.catalysts?.length) { const u = state.catalysts.filter(c => c.status !== "passed").slice(0, 5); if (u.length) { lines.push("\nCATALYSTS:"); for (const c of u) lines.push(`  ${c.date} ${c.position}: ${c.event}`); } }
   if (state.pipeline?.length) { const ac = state.pipeline.filter(p => p.status !== "filled"); if (ac.length) { lines.push("\nPIPELINE:"); for (const pp of ac) lines.push(`  Slot${pp.slot} [${pp.status}] ${pp.candidate} — ${pp.day}`); } }
   if (state.pm_profile?.patterns_to_watch?.length) lines.push(`\nPM WATCH: ${state.pm_profile.patterns_to_watch.join(". ")}`);
+
+  // ═══ ALGO ENGINE OUTPUT — injected into every call ═══
+  if (algoOutput?.dashboard) {
+    lines.push("\n" + algoOutput.dashboard);
+    lines.push("\nINSTRUCTION: The ALGO ENGINE OUTPUT above is from quantitative algorithms. Reference specific numbers (stop distances, R:R, correlation %). When RED alerts appear, address them FIRST.");
+  }
+
+  // ═══ LEARNING — recent intelligence ═══
+  if (learningData?.knowledge?.length) {
+    lines.push("\n=== RECENT INTELLIGENCE ===");
+    for (const k of learningData.knowledge.slice(-10)) lines.push(`  [${k.category}] ${k.fact} (${k.date})`);
+  }
+
   return lines.join("\n");
 }
 
@@ -200,20 +215,28 @@ export async function POST(req) {
     if (!body.messages?.length) return NextResponse.json({ error: "Missing messages" }, { status: 400 });
     const userMsg = body.messages[body.messages.length - 1]?.content || "";
 
-    // Client state passthrough — UI sends state + prices with every message
     const clientState = body.client_state || null;
     const clientPrices = body.client_prices || null;
 
-    // Load from KV (fallback to client, fallback to default)
-    const fundState = clientState || await kvGet("apex:state") || DEFAULT_STATE;
-
-    // Fetch prices — dynamic based on held positions
+    // Load state + prices + learning in parallel
+    const [kvState, learningData] = await Promise.all([
+      kvGet("apex:state"),
+      loadLearningData(),
+    ]);
+    const fundState = clientState || kvState || DEFAULT_STATE;
     const serverPrices = await loadPrices(fundState.positions || []);
     const mergedPrices = { ...serverPrices, ...(clientPrices || {}) };
 
+    // ═══ RUN ALGO ENGINE ═══
+    const algoOutput = runAlgoEngine(fundState.positions || [], mergedPrices, fundState.account);
+
     // Fast path
     const fast = tryFastPath(userMsg, fundState, mergedPrices);
-    if (fast) return NextResponse.json({ content: fast.content, pathway: fast.pathway, urgency: "normal", entities: [], compliance: "CLEAR", knowledge_flags: [] });
+    if (fast) return NextResponse.json({
+      content: fast.content, pathway: fast.pathway, urgency: "normal",
+      entities: [], compliance: "CLEAR", knowledge_flags: [],
+      algo: { screens_red: algoOutput.screens.filter(s => s.level === "RED").length, screens_amber: algoOutput.screens.filter(s => s.level === "AMBER").length },
+    });
 
     // ═══ REGEX-FIRST ROUTING ═══
     let pathway = "general", entities = [], urgency = "normal", contextNotes = "";
@@ -231,11 +254,9 @@ export async function POST(req) {
     else if (l.match(/algo|screen|signal|scan|darvas|monte carlo|risk model/)) pathway = "deep_analysis";
     else regexMatched = false;
 
-    // Extract tickers
     const tickerRe = userMsg.match(/\b(JPM|BAC|FCX|NVDA|MSFT|MS|SMCI|COPX|EWJ|TLT|CVX|MPC|GLNG|APD|DAL|IAG|LNG|FRO|SPX|BRENT|EQT|UAL|BAE|XOM|LMT|RTX|GD|SLB|HAL)\b/gi);
     if (tickerRe) entities = [...new Set(tickerRe.map(t => t.toUpperCase()))];
 
-    // API router fallback for unmatched complex messages
     if (!regexMatched && userMsg.length > 15) {
       try {
         const rr = await callClaude(ROUTER_PROMPT, [{ role: "user", content: userMsg }], false, 200);
@@ -251,7 +272,7 @@ export async function POST(req) {
     await delay(200);
 
     // ═══ BUILD SYSTEM PROMPT ═══
-    const fc = formatContext(fundState, serverPrices, clientPrices);
+    const fc = formatContext(fundState, serverPrices, clientPrices, algoOutput, learningData);
     let sp = BRAINSTEM + "\n\n" + AMYGDALA_PREAMBLE + "\n\n" + PATHWAYS[pathway];
     if (["weekly_review", "deep_analysis", "investor_update"].includes(pathway)) {
       const cs = getCortexSections(pathway, entities, contextNotes);
@@ -259,15 +280,11 @@ export async function POST(req) {
     }
     sp += fc;
 
-    // Live timestamp
     const ukNow = new Date().toLocaleDateString("en-GB", { weekday: "long", year: "numeric", month: "long", day: "numeric", timeZone: "Europe/London" }) + " " + new Date().toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", timeZone: "Europe/London" });
     const conflictDay = Math.floor((Date.now() - new Date("2026-02-28").getTime()) / 86400000);
     sp += `\n\nCURRENT DATE/TIME: ${ukNow} (UK). Conflict Day ${conflictDay}. When searching for news, use today's date.`;
-
-    // Price authority
     sp += `\n\nPRICE AUTHORITY: Prices in LIVE FUND STATE are from Yahoo Finance, fetched THIS call. Use them — do NOT web-search for prices already shown. Only search for NEWS/ANALYSIS.`;
 
-    // Call APEX
     const useSearch = ["morning_brief", "trade_proposal", "position_review", "weekly_review", "crisis", "deep_analysis", "investor_update"].includes(pathway);
     const clean = body.messages.map(m => ({ role: m.role, content: m.content }));
     const apex = await callClaude(sp, clean, useSearch, 4096);
@@ -290,17 +307,11 @@ export async function POST(req) {
     let ft = cleanText;
     if (flag) ft += `\n\n⚠️ **COMPLIANCE FLAG**\n${flag}`;
 
-    // Store knowledge flags
+    // Store knowledge flags async
     if (knowledgeFlags.length > 0) {
       try {
         const origin = process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : req.nextUrl?.origin || "";
-        if (origin) {
-          fetch(`${origin}/api/state`, {
-            method: "POST",
-            headers: { "x-apex-key": auth, "Content-Type": "application/json" },
-            body: JSON.stringify({ action: "store_knowledge", flags: knowledgeFlags }),
-          }).catch(() => {});
-        }
+        if (origin) fetch(`${origin}/api/state`, { method: "POST", headers: { "x-apex-key": auth, "Content-Type": "application/json" }, body: JSON.stringify({ action: "store_knowledge", flags: knowledgeFlags }) }).catch(() => {});
       } catch {}
     }
 
@@ -311,6 +322,12 @@ export async function POST(req) {
       compliance: flag ? "VIOLATION" : "CLEAR",
       knowledge_flags: knowledgeFlags,
       cost: { calls: callCount, est_usd: callCount * 0.02 },
+      algo: {
+        screens_red: algoOutput.screens.filter(s => s.level === "RED").length,
+        screens_amber: algoOutput.screens.filter(s => s.level === "AMBER").length,
+        risk_pct: algoOutput.risk?.max_drawdown_pct,
+        correlation_violations: algoOutput.correlation?.violations?.length || 0,
+      },
     });
   } catch (err) {
     console.error("Brain error:", err);
