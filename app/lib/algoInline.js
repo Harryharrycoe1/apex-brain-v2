@@ -1,0 +1,253 @@
+// APEX BRAIN V2 — ALGO INLINE (Tiers 1-3)
+// Runs inline with chat route. Provides real-time risk screens + signals.
+
+import { ALGO_THRESHOLDS } from "../data/algoConfig.js";
+
+// ═══ SAFE MATH ═══
+function $(v, d = 2) { const n = Number(v); return isFinite(n) ? n.toFixed(d) : "—"; }
+
+// ═══ DIRECTION-AWARE HELPERS ═══
+function plPerUnit(entry, current, dir) {
+  return (dir === "short" || dir === "sell") ? entry - current : current - entry;
+}
+function stopDistPct(current, stop, dir) {
+  if (!current || !stop) return null;
+  return (dir === "short" || dir === "sell")
+    ? ((stop - current) / current) * 100
+    : ((current - stop) / current) * 100;
+}
+function t1DistPct(current, t1, dir) {
+  if (!current || !t1) return null;
+  return (dir === "short" || dir === "sell")
+    ? ((current - t1) / current) * 100
+    : ((t1 - current) / current) * 100;
+}
+function liveRR(current, stop, t1, dir) {
+  const risk = Math.abs(current - stop);
+  const reward = Math.abs(t1 - current);
+  if (!risk || risk === 0) return null;
+  return reward / risk;
+}
+function isProfitable(entry, current, dir) {
+  return plPerUnit(entry, current, dir) > 0;
+}
+
+// ═══ TIER 1: BASIC SCREENS ═══
+function runScreens(positions, prices, account) {
+  const screens = [];
+  const nav = Number(account?.nav) || 1;
+  const gbp = Number(account?.gbp_usd) || 1.34;
+  const T = ALGO_THRESHOLDS;
+
+  for (const pos of positions) {
+    const lp = prices[pos.id]?.price;
+    if (!lp) continue;
+    const dir = (pos.direction || "buy").toLowerCase();
+    const entry = Number(pos.entry_price);
+    const units = Number(pos.units);
+
+    // S1: Stop proximity
+    if (pos.stop) {
+      const sd = stopDistPct(lp, pos.stop, dir);
+      if (sd !== null && sd < T.stop_proximity_critical) {
+        screens.push({ ticker: pos.id, screen: "STOP_CRITICAL", level: "RED", detail: `${$(sd, 1)}% from stop ($${pos.stop})`, value: sd });
+      } else if (sd !== null && sd < T.stop_proximity_warn) {
+        screens.push({ ticker: pos.id, screen: "STOP_WARN", level: "AMBER", detail: `${$(sd, 1)}% from stop ($${pos.stop})`, value: sd });
+      }
+    }
+
+    // S2: T1 proximity
+    if (pos.t1) {
+      const td = t1DistPct(lp, pos.t1, dir);
+      if (td !== null && td < T.t1_proximity && td > 0) {
+        screens.push({ ticker: pos.id, screen: "T1_APPROACHING", level: "GREEN", detail: `${$(td, 1)}% from T1 ($${pos.t1})`, value: td });
+      }
+    }
+
+    // S3: R:R deterioration
+    if (pos.stop && pos.t1) {
+      const rr = liveRR(lp, pos.stop, pos.t1, dir);
+      if (rr !== null && rr < 1.5) {
+        screens.push({ ticker: pos.id, screen: "RR_DETERIORATED", level: "RED", detail: `R:R now ${$(rr, 1)}:1 — below minimum`, value: rr });
+      } else if (rr !== null && rr < T.min_rr) {
+        screens.push({ ticker: pos.id, screen: "RR_BELOW_MIN", level: "AMBER", detail: `R:R now ${$(rr, 1)}:1 — below 3:1 rule`, value: rr });
+      }
+    }
+
+    // S4: Daily loss cap (R2)
+    const posRisk = Math.abs(lp - (pos.stop || lp)) * units;
+    const posRiskGbp = pos.currency === "GBP" ? posRisk : posRisk / gbp;
+    const riskPct = (posRiskGbp / nav) * 100;
+    if (riskPct > T.daily_loss_cap * 2) {
+      screens.push({ ticker: pos.id, screen: "R2_VIOLATION", level: "RED", detail: `${$(riskPct, 1)}% NAV at risk — exceeds 1% daily cap`, value: riskPct });
+    }
+
+    // S5: Position in loss
+    if (!isProfitable(entry, lp, dir)) {
+      const lossPct = Math.abs(plPerUnit(entry, lp, dir) / entry * 100);
+      if (lossPct > 10) {
+        screens.push({ ticker: pos.id, screen: "DEEP_LOSS", level: "RED", detail: `Down ${$(lossPct, 1)}% from entry`, value: lossPct });
+      }
+    }
+
+    // S6: Turkey Rule (R11) — profitable > 10 days without review
+    if (pos.entry_date) {
+      const daysHeld = Math.floor((Date.now() - new Date(pos.entry_date).getTime()) / 86400000);
+      if (daysHeld > T.turkey_days && isProfitable(entry, lp, dir)) {
+        screens.push({ ticker: pos.id, screen: "TURKEY_RULE", level: "AMBER", detail: `Profitable ${daysHeld} days — R11 bear case review required`, value: daysHeld });
+      }
+    }
+  }
+
+  return screens;
+}
+
+// ═══ TIER 2: CORRELATION AUDIT ═══
+function runCorrelation(positions, account) {
+  const nav = Number(account?.nav) || 1;
+  const themes = {};
+
+  for (const pos of positions) {
+    const sector = getSector(pos.id);
+    if (!themes[sector]) themes[sector] = { positions: [], exposure: 0 };
+    themes[sector].positions.push(pos.id);
+    // Approximate exposure in GBP
+    const val = Number(pos.entry_price) * Number(pos.units);
+    const gbp = pos.currency === "GBP" ? val : val / (Number(account?.gbp_usd) || 1.34);
+    themes[sector].exposure += gbp;
+  }
+
+  const violations = [];
+  for (const [theme, data] of Object.entries(themes)) {
+    const pct = (data.exposure / nav) * 100;
+    if (pct > ALGO_THRESHOLDS.max_single_theme) {
+      violations.push({ theme, positions: data.positions, exposure_pct: parseFloat($(pct, 1)), level: "RED", detail: `${theme} at ${$(pct, 1)}% NAV — exceeds 40% R7 limit` });
+    }
+  }
+
+  // Barbell check (R15)
+  const sleeves = {};
+  for (const pos of positions) {
+    const s = pos.sleeve || "B";
+    if (!sleeves[s]) sleeves[s] = 0;
+    sleeves[s]++;
+  }
+  const hasIndependent = sleeves["Independent"] > 0 || sleeves["C"] > 0;
+  if (!hasIndependent && positions.length >= 5) {
+    violations.push({ theme: "BARBELL", positions: [], exposure_pct: 0, level: "AMBER", detail: "R15: No independent/hedge positions — barbell structure incomplete" });
+  }
+
+  return { themes: Object.fromEntries(Object.entries(themes).map(([k, v]) => [k, { ...v, pct: parseFloat($(v.exposure / nav * 100, 1)) }])), violations };
+}
+
+function getSector(ticker) {
+  const map = {
+    JPM: "Financial", BAC: "Financial", MS: "Financial", GS: "Financial",
+    FCX: "Materials", COPX: "Materials",
+    NVDA: "Technology", MSFT: "Technology", SMCI: "Technology", AVGO: "Technology",
+    MPC: "Energy", CVX: "Energy", XOM: "Energy", SLB: "Energy", HAL: "Energy",
+    LMT: "Defence", RTX: "Defence", GD: "Defence",
+    DAL: "Airlines", UAL: "Airlines", IAG: "Airlines",
+    GLNG: "LNG", LNG: "LNG", APD: "Industrial Gas", EQT: "Natural Gas",
+    EWJ: "International", TLT: "Bonds", GDX: "Metals", XLU: "Utilities", VNQ: "REITs",
+  };
+  return map[ticker?.toUpperCase()] || "Other";
+}
+
+// ═══ TIER 3: PORTFOLIO RISK ═══
+function runPortfolioRisk(positions, prices, account) {
+  const nav = Number(account?.nav) || 1;
+  const gbp = Number(account?.gbp_usd) || 1.34;
+  let totalRisk = 0, totalExposure = 0, totalOpenPL = 0;
+  const positionRisks = [];
+
+  for (const pos of positions) {
+    const lp = prices[pos.id]?.price;
+    const entry = Number(pos.entry_price);
+    const units = Number(pos.units);
+    const dir = (pos.direction || "buy").toLowerCase();
+
+    // Exposure
+    const expUsd = (lp || entry) * units;
+    const expGbp = pos.currency === "GBP" ? expUsd : expUsd / gbp;
+    totalExposure += expGbp;
+
+    // Risk (distance to stop)
+    if (pos.stop && lp) {
+      const riskUsd = Math.abs(lp - pos.stop) * units;
+      const riskGbp = pos.currency === "GBP" ? riskUsd : riskUsd / gbp;
+      totalRisk += riskGbp;
+      positionRisks.push({ ticker: pos.id, risk_gbp: parseFloat($(riskGbp)), risk_pct: parseFloat($((riskGbp / nav) * 100, 1)) });
+    }
+
+    // Open P&L
+    if (lp) {
+      const pl = plPerUnit(entry, lp, dir) * units;
+      totalOpenPL += pos.currency === "GBP" ? pl : pl / gbp;
+    }
+  }
+
+  return {
+    total_exposure_gbp: parseFloat($(totalExposure)),
+    exposure_pct: parseFloat($((totalExposure / nav) * 100, 1)),
+    total_risk_gbp: parseFloat($(totalRisk)),
+    max_drawdown_pct: parseFloat($((totalRisk / nav) * 100, 1)),
+    open_pl_gbp: parseFloat($(totalOpenPL)),
+    position_risks: positionRisks,
+    cash_pct: parseFloat($(((nav - totalExposure) / nav) * 100, 1)),
+  };
+}
+
+// ═══ FORMAT DASHBOARD ═══
+function formatDashboard(screens, correlation, risk) {
+  const lines = ["=== ALGO ENGINE OUTPUT ==="];
+
+  // Screens
+  const reds = screens.filter(s => s.level === "RED");
+  const ambers = screens.filter(s => s.level === "AMBER");
+  const greens = screens.filter(s => s.level === "GREEN");
+
+  if (reds.length) {
+    lines.push(`\n🔴 RED ALERTS (${reds.length}):`);
+    for (const s of reds) lines.push(`  ${s.ticker}: ${s.screen} — ${s.detail}`);
+  }
+  if (ambers.length) {
+    lines.push(`\n🟡 WARNINGS (${ambers.length}):`);
+    for (const s of ambers) lines.push(`  ${s.ticker}: ${s.screen} — ${s.detail}`);
+  }
+  if (greens.length) {
+    lines.push(`\n🟢 SIGNALS (${greens.length}):`);
+    for (const s of greens) lines.push(`  ${s.ticker}: ${s.screen} — ${s.detail}`);
+  }
+
+  // Correlation
+  if (correlation.violations.length) {
+    lines.push(`\n⚠️ CORRELATION:`);
+    for (const v of correlation.violations) lines.push(`  ${v.detail}`);
+  }
+  lines.push(`\nTHEME EXPOSURE:`);
+  for (const [theme, data] of Object.entries(correlation.themes)) {
+    lines.push(`  ${theme}: ${data.pct}% NAV (${data.positions.join(", ")})`);
+  }
+
+  // Risk
+  lines.push(`\nPORTFOLIO RISK:`);
+  lines.push(`  Exposure: £${risk.total_exposure_gbp} (${risk.exposure_pct}% NAV)`);
+  lines.push(`  Max drawdown: £${risk.total_risk_gbp} (${risk.max_drawdown_pct}% NAV)`);
+  lines.push(`  Open P&L: ${risk.open_pl_gbp >= 0 ? "+" : ""}£${risk.open_pl_gbp}`);
+  lines.push(`  Cash: ${risk.cash_pct}% NAV`);
+
+  return lines.join("\n");
+}
+
+// ═══ MAIN EXPORT ═══
+export function runAlgoEngine(positions, prices, account) {
+  if (!positions?.length) return { screens: [], correlation: { themes: {}, violations: [] }, risk: {}, dashboard: "=== ALGO ENGINE === No positions to analyse." };
+
+  const screens = runScreens(positions, prices, account);
+  const correlation = runCorrelation(positions, account);
+  const risk = runPortfolioRisk(positions, prices, account);
+  const dashboard = formatDashboard(screens, correlation, risk);
+
+  return { screens, correlation, risk, dashboard };
+}
