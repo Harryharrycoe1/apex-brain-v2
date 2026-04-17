@@ -58,16 +58,11 @@ export const DEFAULT_STATE = {
     },
   ],
 
-  // ═══ PIPELINE — QUEUED FOR DEPLOYMENT THIS WEEK ═══
-  pipeline: [
-    { slot: 4, status: "armed", candidate: "NVDA", sleeve: "C", entry_target: 177.45, stop: 155, t1: 210, day: "Tuesday", thesis: "AI backbone — Rubin GPU H2 2026, $4.3T market cap, 5x perf over Blackwell" },
-    { slot: 5, status: "armed", candidate: "MSFT", sleeve: "C", entry_target: 355.12, stop: 320, t1: 405, day: "Tuesday", thesis: "Enterprise software resilience, AI integration catalyst" },
-    { slot: 6, status: "armed", candidate: "MS", sleeve: "B", entry_target: 132.19, stop: 120, t1: 155, day: "Tuesday", thesis: "Trading revenue + IB fees in volatile market" },
-    { slot: 7, status: "armed", candidate: "SMCI", sleeve: "C", entry_target: 90, stop: 78, t1: 110, day: "Wednesday", thesis: "AI infrastructure, AVGO substitute at accessible price point" },
-    { slot: 8, status: "armed", candidate: "COPX", sleeve: "B", entry_target: 62.15, stop: 55, t1: 72, day: "Wednesday", thesis: "Diversified copper exposure via ETF" },
-    { slot: 9, status: "armed", candidate: "EWJ", sleeve: "B", entry_target: 74.52, stop: 67, t1: 85, day: "Thu/Fri", thesis: "Japan value — discount valuations, corporate reform, weak yen" },
-    { slot: 10, status: "armed", candidate: "TLT", sleeve: "Independent", entry_target: 89.73, stop: 82, t1: 102, day: "Thu/Fri", thesis: "Bond hedge — uncorrelated to equity risk, rate cut hedge" },
-  ],
+  // ═══ LEGACY PIPELINE (deprecated — use active_pipeline instead) ═══
+  pipeline: [],
+
+  // ═══ ACTIVE PIPELINE — user-promoted opportunities ready to execute ═══
+  active_pipeline: [],
 
   // ═══ CLOSED TRADES — FULL HISTORY ═══
   closed: [
