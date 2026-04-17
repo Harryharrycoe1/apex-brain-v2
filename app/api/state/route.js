@@ -268,6 +268,49 @@ export async function POST(req) {
         return NextResponse.json({ log: state.strategy_log || [], count: (state.strategy_log || []).length });
       }
 
+      // ═══ PIPELINE MANAGEMENT ═══
+      case "remove_pipeline": {
+        const ticker = (body.ticker || body.candidate || "").toUpperCase();
+        if (!ticker) return NextResponse.json({ error: "Missing ticker" }, { status: 400 });
+        if (!state.pipeline) state.pipeline = [];
+        const before = state.pipeline.length;
+        state.pipeline = state.pipeline.filter(p => (p.candidate || "").toUpperCase() !== ticker);
+        const removed = before - state.pipeline.length;
+        if (removed === 0) return NextResponse.json({ error: `${ticker} not in pipeline`, pipeline: state.pipeline }, { status: 404 });
+        await logStrategy(state, `REMOVED ${ticker} from pipeline`);
+        const ok = await kvSet("apex:state", state);
+        return NextResponse.json({ ok, action: "remove_pipeline", removed, pipeline: state.pipeline });
+      }
+
+      case "clear_pipeline": {
+        const before = (state.pipeline || []).length;
+        state.pipeline = [];
+        await logStrategy(state, `CLEARED pipeline (${before} entries removed)`);
+        const ok = await kvSet("apex:state", state);
+        return NextResponse.json({ ok, action: "clear_pipeline", removed: before });
+      }
+
+      case "add_pipeline": {
+        const candidate = (body.candidate || body.ticker || "").toUpperCase();
+        if (!candidate) return NextResponse.json({ error: "Missing ticker/candidate" }, { status: 400 });
+        if (!state.pipeline) state.pipeline = [];
+        if (state.pipeline.some(p => (p.candidate || "").toUpperCase() === candidate)) {
+          return NextResponse.json({ error: `${candidate} already in pipeline` }, { status: 400 });
+        }
+        const entry = {
+          candidate,
+          slot: body.slot || state.pipeline.length + 1,
+          status: body.status || "watching",
+          thesis: body.thesis || "",
+          day: body.day || "",
+          entry_trigger: body.entry_trigger || "",
+        };
+        state.pipeline.push(entry);
+        await logStrategy(state, `ADDED ${candidate} to pipeline — ${entry.status}`);
+        const ok = await kvSet("apex:state", state);
+        return NextResponse.json({ ok, action: "add_pipeline", entry });
+      }
+
       default:
         return NextResponse.json({ error: `Unknown action: ${action}` }, { status: 400 });
     }
