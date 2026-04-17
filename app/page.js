@@ -35,6 +35,8 @@ export default function ApexBrain(){
   const[showSync,setShowSync]=useState(false);
   const[editPos,setEditPos]=useState(null);
   const[closePos,setClosePos]=useState(null);
+  const[showDeposit,setShowDeposit]=useState(false);
+  const[depositAmount,setDepositAmount]=useState("");
   const chatEnd=useRef(null);
   const chatScroller=useRef(null);
   const lastMsgCount=useRef(0);
@@ -45,15 +47,25 @@ export default function ApexBrain(){
   const logout=()=>{localStorage.removeItem("apex_key");setAuthed(false);setMessages([]);};
 
   // LOADERS
-  const loadState=useCallback(async()=>{if(!accessKey)return;try{const r=await fetch("/api/state",{headers:{"x-apex-key":accessKey}});if(r.ok){const d=await r.json();if(d.state)setState(d.state);}}catch{};},[accessKey]);
-  const loadPrices=useCallback(async()=>{if(!accessKey)return;try{const r=await fetch("/api/prices",{headers:{"x-apex-key":accessKey}});if(r.ok){const d=await r.json();setPrices(d.prices||{});setPriceTime(d.uk_time||"");setMarketState(d.market_state||"");}}catch{};},[accessKey]);
-  const loadNews=useCallback(async()=>{if(!accessKey)return;try{const r=await fetch("/api/news",{headers:{"x-apex-key":accessKey}});if(r.ok){const d=await r.json();setNews(d.articles||[]);setNewsTime(d.uk_time||"");}}catch{};},[accessKey]);
-  const loadHealth=useCallback(async()=>{if(!accessKey)return;try{const r=await fetch("/api/health",{headers:{"x-apex-key":accessKey}});if(r.ok)setHealth(await r.json());}catch{};},[accessKey]);
-  const loadScanner=useCallback(async()=>{if(!accessKey)return;setScannerLoading(true);try{const r=await fetch("/api/scanner",{headers:{"x-apex-key":accessKey}});if(r.ok){const d=await r.json();setScanner(d);setScannerTime(new Date().toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit",timeZone:"Europe/London"}));}}catch{};setScannerLoading(false);},[accessKey]);
-  const loadRegime=useCallback(async()=>{if(!accessKey)return;try{const r=await fetch("/api/regime",{headers:{"x-apex-key":accessKey}});if(r.ok){const d=await r.json();setRegime(d);}}catch{};},[accessKey]);
-  const loadPeaceSignal=useCallback(async()=>{if(!accessKey)return;try{const r=await fetch("/api/altdata?source=peace_signal",{headers:{"x-apex-key":accessKey}});if(r.ok){const d=await r.json();setPeaceSignal(d.peace_signal);}}catch{};},[accessKey]);
-  const loadStrategyLog=useCallback(async()=>{if(!accessKey)return;try{const r=await fetch("/api/state",{method:"POST",headers:{"Content-Type":"application/json","x-apex-key":accessKey},body:JSON.stringify({action:"get_strategy_log"})});if(r.ok){const d=await r.json();setStrategyLog(d.log||[]);}}catch{};},[accessKey]);
-  const loadSocial=useCallback(async()=>{if(!accessKey)return;try{const r=await fetch("/api/social",{headers:{"x-apex-key":accessKey}});if(r.ok){const d=await r.json();setSocial(d.posts||d.articles||[]);setSocialTime(new Date().toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit",timeZone:"Europe/London"}));}}catch{};},[accessKey]);
+  const loadState=useCallback(async()=>{if(!accessKey)return;try{const r=await fetch("/api/state",{headers:{"x-apex-key":accessKey}});if(r.ok){const d=await r.json();if(d.state)setState(d.state);}else console.error("loadState HTTP "+r.status);}catch(e){console.error("loadState:",e.message);}},[accessKey]);
+  const loadPrices=useCallback(async()=>{if(!accessKey)return;try{const r=await fetch("/api/prices",{headers:{"x-apex-key":accessKey}});if(r.ok){const d=await r.json();setPrices(d.prices||{});setPriceTime(d.uk_time||"");setMarketState(d.market_state||"");}else console.error("loadPrices HTTP "+r.status);}catch(e){console.error("loadPrices:",e.message);}},[accessKey]);
+  const loadNews=useCallback(async()=>{if(!accessKey)return;try{const r=await fetch("/api/news",{headers:{"x-apex-key":accessKey}});if(r.ok){const d=await r.json();setNews(d.articles||[]);setNewsTime(d.uk_time||"");}else console.error("loadNews HTTP "+r.status);}catch(e){console.error("loadNews:",e.message);}},[accessKey]);
+  const loadHealth=useCallback(async()=>{if(!accessKey)return;try{const r=await fetch("/api/health",{headers:{"x-apex-key":accessKey}});if(r.ok)setHealth(await r.json());else console.error("loadHealth HTTP "+r.status);}catch(e){console.error("loadHealth:",e.message);}},[accessKey]);
+  const loadScanner=useCallback(async()=>{if(!accessKey)return;setScannerLoading(true);try{const r=await fetch("/api/scanner",{headers:{"x-apex-key":accessKey}});if(r.ok){const d=await r.json();setScanner(d);setScannerTime(new Date().toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit",timeZone:"Europe/London"}));}else console.error("loadScanner HTTP "+r.status);}catch(e){console.error("loadScanner:",e.message);}setScannerLoading(false);},[accessKey]);
+  const loadRegime=useCallback(async()=>{if(!accessKey)return;try{const r=await fetch("/api/regime",{headers:{"x-apex-key":accessKey}});if(r.ok){const d=await r.json();setRegime(d);}}catch(e){console.error("loadRegime:",e.message);}},[accessKey]);
+  const loadPeaceSignal=useCallback(async()=>{if(!accessKey)return;try{const r=await fetch("/api/altdata?source=peace_signal",{headers:{"x-apex-key":accessKey}});if(r.ok){const d=await r.json();setPeaceSignal(d.peace_signal);}}catch(e){console.error("loadPeaceSignal:",e.message);}},[accessKey]);
+  const loadStrategyLog=useCallback(async()=>{if(!accessKey)return;try{const r=await fetch("/api/state",{method:"POST",headers:{"Content-Type":"application/json","x-apex-key":accessKey},body:JSON.stringify({action:"get_strategy_log"})});if(r.ok){const d=await r.json();setStrategyLog(d.log||[]);}}catch(e){console.error("loadStrategyLog:",e.message);}},[accessKey]);
+  const loadSocial=useCallback(async()=>{if(!accessKey)return;try{const r=await fetch("/api/social",{headers:{"x-apex-key":accessKey}});if(r.ok){const d=await r.json();
+    // Combine reddit, stocktwits, twitter into unified feed
+    const unified=[];
+    for(const p of (d.reddit||[])){unified.push({type:"reddit",source:"r/"+p.subreddit,title:p.title,text:p.text,url:p.url,created:p.created,score:p.score,comments:p.comments});}
+    for(const p of (d.stocktwits_held||[])){unified.push({type:"stocktwits",source:"ST $"+p.symbol,title:p.text,sentiment:p.sentiment,user:p.user,url:p.url,created:p.created,likes:p.likes});}
+    for(const p of (d.twitter||[])){unified.push({type:"twitter",source:"@"+p.account,title:p.text,url:p.url,created:p.created});}
+    // Sort by created date desc
+    unified.sort((a,b)=>{if(!a.created)return 1;if(!b.created)return -1;return new Date(b.created)-new Date(a.created);});
+    setSocial(unified);
+    setSocialTime(d.uk_time||new Date().toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit",timeZone:"Europe/London"}));
+  }}catch{};},[accessKey]);
 
   // VOICE INPUT (browser native Web Speech API)
   const startListening=useCallback(()=>{if(typeof window==="undefined")return;const SR=window.SpeechRecognition||window.webkitSpeechRecognition;if(!SR){alert("Voice not supported on this browser. Try Chrome or Safari.");return;}const r=new SR();r.continuous=false;r.interimResults=true;r.lang="en-GB";r.onstart=()=>setIsListening(true);r.onresult=e=>{const t=Array.from(e.results).map(res=>res[0].transcript).join("");setInput(t);};r.onerror=()=>setIsListening(false);r.onend=()=>setIsListening(false);recognitionRef.current=r;r.start();},[]);
@@ -67,12 +79,12 @@ export default function ApexBrain(){
   useEffect(()=>{if(tab!=="news"||!authed)return;const iv=setInterval(()=>{loadNews();loadSocial();},900000);return()=>clearInterval(iv);},[tab,authed,loadNews,loadSocial]);
   useEffect(()=>{if(tab==="health")loadHealth();},[tab,loadHealth]);
   useEffect(()=>{if(tab==="pipeline")loadScanner();},[tab,loadScanner]);
-  useEffect(()=>{if(tab!=="pipeline"||!authed)return;const iv=setInterval(loadScanner,300000);return()=>clearInterval(iv);},[tab,authed,loadScanner]);
+  useEffect(()=>{if(tab!=="pipeline"||!authed)return;const iv=setInterval(()=>{loadScanner();loadState();loadPrices();},300000);return()=>clearInterval(iv);},[tab,authed,loadScanner,loadState,loadPrices]);
   useEffect(()=>{if(tab==="performance"){loadStrategyLog();loadRegime();loadState();loadPrices();}},[tab,loadStrategyLog,loadRegime,loadState,loadPrices]);
   useEffect(()=>{if(tab!=="performance"||!authed)return;const iv=setInterval(()=>{loadState();loadPrices();loadStrategyLog();},60000);return()=>clearInterval(iv);},[tab,authed,loadState,loadPrices,loadStrategyLog]);
   useEffect(()=>{if(authed){loadRegime();loadPeaceSignal();}},[authed,loadRegime,loadPeaceSignal]);
   useEffect(()=>{if(!authed)return;const iv=setInterval(()=>{loadRegime();loadPeaceSignal();},1800000);return()=>clearInterval(iv);},[authed,loadRegime,loadPeaceSignal]);
-  useEffect(()=>{if(messages.length>lastMsgCount.current){chatEnd.current?.scrollIntoView({behavior:"smooth",block:"end"});lastMsgCount.current=messages.length;}},[messages]);
+  useEffect(()=>{if(messages.length>lastMsgCount.current&&chatScroller.current){chatScroller.current.scrollTop=chatScroller.current.scrollHeight;lastMsgCount.current=messages.length;}},[messages]);
 
   // SEND MESSAGE
   const sendMessage=async(text)=>{const msg=text||input.trim();if(!msg||loading)return;setInput("");setMessages(p=>[...p,{role:"user",content:msg}]);setLoading(true);
@@ -108,6 +120,15 @@ export default function ApexBrain(){
     else alert("Error: "+(d?.error||"unknown"));
   };
   const setClosePct=(pct)=>{if(!closePos)return;const u=parseFloat((closePos.max_units*(pct/100)).toFixed(4));setClosePos(p=>({...p,units:u,pct}));};
+
+  // ADD CAPITAL
+  const submitDeposit=async()=>{
+    const amt=Number(depositAmount);
+    if(!amt||amt<=0){alert("Please enter a valid amount");return;}
+    const d=await stateAction("add_deposit",{amount:amt,date:new Date().toISOString().slice(0,10)});
+    if(d?.ok){setShowDeposit(false);setDepositAmount("");await loadState();await loadStrategyLog();}
+    else alert("Error: "+(d?.error||"unknown"));
+  };
 
   // AUTH SCREEN
   if(!authed) return(
@@ -170,7 +191,7 @@ export default function ApexBrain(){
             {peaceSignal&&<span>Peace: <span style={{color:peaceSignal.score>=3?T.green:peaceSignal.score>=1?T.amber:T.textDim,fontWeight:700}}>{peaceSignal.score}/8</span></span>}
             {regime?.shift?.shift_detected&&<span style={{color:T.red,fontWeight:700}}>⚠️ REGIME SHIFT</span>}
           </div>)}
-          <div style={{flex:1,overflowY:"auto",padding:"8px 12px"}}>
+          <div ref={chatScroller} style={{flex:1,overflowY:"auto",padding:"8px 12px"}}>
             {messages.length===0&&(<div style={{textAlign:"center",marginTop:40,color:T.textDim}}>
               <div style={{fontSize:36,marginBottom:6}}>🧠</div><div style={{fontSize:13,fontWeight:600}}>APEX BRAIN V4.6</div>
               <div style={{fontSize:10,marginTop:4}}>Chat commands: "move JPM stop to 300" • "close BAC at 54" • "BAC T1 to 57"</div>
@@ -241,64 +262,151 @@ export default function ApexBrain(){
               {scannerTime&&<span style={{fontSize:9,color:T.textDim,marginLeft:8}}>Updated {scannerTime}</span>}
             </div>
             <div style={{display:"flex",gap:6}}>
-              <button onClick={loadScanner} disabled={scannerLoading} style={{padding:"5px 10px",background:T.cardHover,color:T.text,border:`1px solid ${T.border}`,borderRadius:6,fontSize:10,cursor:scannerLoading?"wait":"pointer"}}>{scannerLoading?"⏳":"🔄"} Refresh</button>
-              <button onClick={()=>sendMessage("Deep analysis on top 3 scanner opportunities — full trade construction for each")} style={{padding:"5px 10px",background:T.gold,color:"#000",fontWeight:600,border:"none",borderRadius:6,fontSize:10,cursor:"pointer"}}>🧠 Deep Dive</button>
+              <button onClick={loadScanner} disabled={scannerLoading} style={{padding:"5px 10px",background:T.cardHover,color:T.text,border:`1px solid ${T.border}`,borderRadius:6,fontSize:10,cursor:scannerLoading?"wait":"pointer"}}>{scannerLoading?"⏳":"🔄"} Scan</button>
             </div>
           </div>
 
-          {scanner&&(<div style={{fontSize:9,color:T.textDim,marginBottom:6}}>
-            Regime: <span style={{color:T.gold}}>{scanner.regime}</span> • Scanned: {scanner.scanned} • Actionable: <span style={{color:T.green}}>{scanner.actionable}</span>
+          {scanner&&(<div style={{fontSize:9,color:T.textDim,marginBottom:10,padding:"6px 8px",background:T.card,borderRadius:6,border:`1px solid ${T.border}`}}>
+            <div>🌐 Universe: <span style={{color:T.text}}>{scanner.universe_size||100}</span> • Scanned: <span style={{color:T.text}}>{scanner.scanned}</span> • Regime: <span style={{color:T.gold}}>{scanner.regime}</span></div>
+            <div style={{marginTop:2}}>✅ Valid (R:R ≥3): <span style={{color:T.green,fontWeight:700}}>{scanner.passing_rr||0}</span> • ❌ Rejected R:R: <span style={{color:T.red}}>{scanner.rejected_rr||0}</span> • 🤷 Low confidence: <span style={{color:T.amber}}>{scanner.rejected_confidence||0}</span>{scanner.dismissed_count>0&&<> • 🚫 Dismissed: <span style={{color:T.textDim}}>{scanner.dismissed_count}</span></>}</div>
           </div>)}
 
-          {/* LIVE OPPORTUNITIES FROM SCANNER */}
-          {scanner?.all?.filter(opp=>!positions.some(p=>p.id===opp.ticker)).slice(0,10).map((opp,i)=>{
-            const gradeColor=opp.grade==="A"?T.green:opp.grade==="B"?T.gold:opp.grade==="C"?T.amber:T.textDim;
-            const scoreBarWidth=Math.max(5,Math.min(100,opp.score));
-            return(<div key={opp.ticker} style={{padding:"10px 12px",background:T.card,borderRadius:8,marginBottom:6,border:`1px solid ${opp.actionable?T.border:T.border}`}}>
-              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-                <div style={{display:"flex",alignItems:"center",gap:8}}>
-                  <span style={{fontSize:14,fontWeight:700,color:T.text}}>{opp.ticker}</span>
-                  <span style={{padding:"2px 6px",background:gradeColor+"20",color:gradeColor,borderRadius:4,fontSize:10,fontWeight:700}}>{opp.grade}</span>
-                  {opp.actionable&&<span style={{padding:"2px 6px",background:T.green+"20",color:T.green,borderRadius:4,fontSize:9,fontWeight:600}}>ACTIONABLE</span>}
+          {/* ═══════════════════════════════════════════ */}
+          {/* ACTIVE PIPELINE — user-promoted, ready to execute */}
+          {/* ═══════════════════════════════════════════ */}
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginTop:4,marginBottom:6}}>
+            <div style={{fontSize:11,fontWeight:700,color:T.green,letterSpacing:1}}>⚡ ACTIVE PIPELINE ({(state?.active_pipeline||[]).length})</div>
+            {(state?.active_pipeline||[]).length>0&&<button onClick={()=>{if(confirm("Clear all active pipeline?"))stateAction("clear_active",{});}} style={{padding:"3px 8px",background:"transparent",color:T.textDim,border:`1px solid ${T.border}`,borderRadius:4,fontSize:9,cursor:"pointer"}}>Clear</button>}
+          </div>
+          <div style={{fontSize:9,color:T.textDim,marginBottom:6}}>Promoted opportunities ready for execution. Live prices + setup refreshed each load.</div>
+          {(state?.active_pipeline||[]).length===0&&<div style={{color:T.textDim,fontSize:11,padding:"12px",textAlign:"center",background:T.card,borderRadius:8,border:`1px dashed ${T.border}`,marginBottom:10}}>No active opportunities. Promote from APEX suggestions below.</div>}
+          {(state?.active_pipeline||[]).map((ap,i)=>{
+            const livePrice=prices[ap.candidate]?.price;
+            const livePct=livePrice&&ap.entry_price?((livePrice-ap.entry_price)/ap.entry_price)*100:null;
+            const stillValid=livePrice?(ap.direction==="buy"?livePrice>=ap.stop&&livePrice<=ap.t1*1.02:livePrice<=ap.stop&&livePrice>=ap.t1*0.98):true;
+            // Staleness: promoted >4 hours ago AND price moved >2%
+            const ageMin=ap.promoted_at?(Date.now()-new Date(ap.promoted_at).getTime())/60000:0;
+            const isStale=ageMin>240&&livePct!=null&&Math.abs(livePct)>2;
+            const borderColor=!stillValid?T.red:isStale?T.amber:T.green;
+            return(<div key={"ap-"+i} style={{padding:"10px 12px",background:T.card,borderRadius:8,marginBottom:6,border:`2px solid ${borderColor}`}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:4}}>
+                <div style={{display:"flex",alignItems:"center",gap:6,flexWrap:"wrap"}}>
+                  <span style={{fontSize:14,fontWeight:700,color:T.text}}>{ap.candidate}</span>
+                  <span style={{padding:"2px 6px",background:ap.direction==="buy"?T.green+"20":T.red+"20",color:ap.direction==="buy"?T.green:T.red,borderRadius:4,fontSize:9,fontWeight:700}}>{ap.direction?.toUpperCase()}</span>
+                  {ap.grade&&<span style={{padding:"2px 6px",background:T.gold+"20",color:T.gold,borderRadius:4,fontSize:9,fontWeight:700}}>Q{ap.grade}</span>}
+                  {!stillValid&&<span style={{padding:"2px 6px",background:T.red+"20",color:T.red,borderRadius:4,fontSize:9,fontWeight:700}}>⚠ STOP BREACHED</span>}
+                  {isStale&&<span style={{padding:"2px 6px",background:T.amber+"20",color:T.amber,borderRadius:4,fontSize:9,fontWeight:700}}>⏳ STALE — REFRESH</span>}
+                  {ap.setup_refreshed&&<span style={{padding:"2px 6px",background:T.gold+"20",color:T.gold,borderRadius:4,fontSize:9,fontWeight:700}}>↻ REFRESHED</span>}
                 </div>
-                <span style={{fontSize:12,color:gradeColor,fontWeight:700}}>{opp.score}/100</span>
+                <span style={{fontSize:10,color:T.textDim}}>R:R {ap.rr}:1 {ageMin>60?`• ${Math.floor(ageMin/60)}h old`:`• ${Math.floor(ageMin)}m`}</span>
               </div>
-              <div style={{marginTop:6,height:4,background:T.cardHover,borderRadius:2,overflow:"hidden"}}>
-                <div style={{width:`${scoreBarWidth}%`,height:"100%",background:gradeColor,borderRadius:2}}/>
+
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:4,marginTop:6,fontSize:10,fontFamily:T.mono}}>
+                <div><span style={{color:T.textDim}}>Entry:</span> <span style={{color:T.text}}>${fmt(ap.entry_price)}</span></div>
+                <div><span style={{color:T.textDim}}>Live:</span> <span style={{color:livePct!=null&&livePct>0?T.green:livePct!=null&&livePct<0?T.red:T.text}}>${livePrice?fmt(livePrice):"—"}{livePct!=null?` (${livePct>=0?"+":""}${fmt(livePct,1)}%)`:""}</span></div>
+                <div><span style={{color:T.textDim}}>Stop:</span> <span style={{color:T.red}}>${fmt(ap.stop)}</span></div>
+                <div><span style={{color:T.textDim}}>T1:</span> <span style={{color:T.green}}>${fmt(ap.t1)}</span></div>
+                <div><span style={{color:T.textDim}}>T2:</span> <span style={{color:T.green}}>${fmt(ap.t2)}</span></div>
+                {ap.sector&&<div><span style={{color:T.textDim}}>Sector:</span> <span style={{color:T.textDim,fontSize:9}}>{ap.sector}</span></div>}
               </div>
-              <div style={{fontSize:9,color:T.textDim,marginTop:4,display:"flex",justifyContent:"space-between"}}>
-                <span>Regime fit: {opp.regime_weight?.toFixed(2)}x</span>
-                <span>Correlation: {opp.correlation_check?.passes?"✓ OK":"⚠ High"}</span>
-              </div>
-              <div style={{display:"flex",gap:6,marginTop:6}}>
-                <button onClick={()=>{setTab("chat");sendMessage(`Deep dive on ${opp.ticker} — full trade construction with entry, stop, T1, T2, R:R, sleeve recommendation. Factor in our current book and the ${scanner.regime} regime.`);}} style={{flex:1,padding:"4px 8px",background:T.cardHover,border:`1px solid ${T.border}`,borderRadius:4,color:T.gold,fontSize:10,cursor:"pointer"}}>Deep Dive →</button>
-                <button onClick={()=>{setAddForm({ticker:opp.ticker,units:"",entry:"",stop:"",t1:"",t2:"",sleeve:"B",direction:"buy",thesis:`Scanner grade ${opp.grade} (${opp.score}/100). ${scanner.regime} regime.`});setShowAdd(true);setTab("positions");}} style={{padding:"4px 8px",background:T.gold,color:"#000",fontWeight:600,border:"none",borderRadius:4,fontSize:10,cursor:"pointer"}}>+ Add</button>
+
+              {/* Position sizing if available */}
+              {ap.suggested_units&&(<div style={{display:"flex",justifyContent:"space-between",marginTop:6,padding:"4px 8px",background:T.cardHover,borderRadius:4,fontSize:10,fontFamily:T.mono}}>
+                <span>Size: <span style={{color:T.text,fontWeight:700}}>{ap.suggested_units}u</span></span>
+                <span>Risk: <span style={{color:ap.pct_nav_at_risk>1?T.red:T.green,fontWeight:700}}>£{fmt(ap.risk_gbp)} ({fmt(ap.pct_nav_at_risk,1)}%)</span></span>
+              </div>)}
+
+              {ap.entry_trigger&&<div style={{fontSize:9,color:T.textDim,marginTop:4,fontStyle:"italic"}}>⚡ {ap.entry_trigger}</div>}
+              {ap.thesis&&<div style={{fontSize:10,color:T.text,marginTop:4,padding:"4px 6px",background:T.cardHover,borderRadius:4,borderLeft:`2px solid ${T.gold}`,lineHeight:1.4}}>💡 {ap.thesis}</div>}
+
+              <div style={{display:"flex",gap:4,marginTop:8}}>
+                <button onClick={()=>{setAddForm({ticker:ap.candidate,units:String(ap.suggested_units||""),entry:String(ap.entry_price||""),stop:String(ap.stop||""),t1:String(ap.t1||""),t2:String(ap.t2||""),sleeve:ap.sleeve||"B",direction:ap.direction||"buy",thesis:ap.thesis||""});setShowAdd(true);setTab("positions");}} style={{flex:2,padding:"6px 8px",background:T.green,color:"#000",fontWeight:700,border:"none",borderRadius:4,fontSize:11,cursor:"pointer"}}>▶ EXECUTE</button>
+                <button onClick={async()=>{const r=await stateAction("update_active",{ticker:ap.candidate});if(r?.ok){await loadState();if(r.entry?.refresh_failed)alert("Refresh failed: "+(r.entry?.refresh_reason||"unknown"));else alert(ap.candidate+" setup refreshed:\n"+r.entry?.direction?.toUpperCase()+" entry $"+r.entry?.entry_price+"\nStop $"+r.entry?.stop+"\nT1 $"+r.entry?.t1+"\nR:R "+r.entry?.rr+":1");}else alert("Refresh failed: "+(r?.error||"unknown"));}} title="Re-scan ticker & rebuild setup from live price" style={{flex:1,padding:"6px 8px",background:T.cardHover,border:`1px solid ${T.border}`,borderRadius:4,color:T.gold,fontSize:11,cursor:"pointer"}}>↻ Refresh</button>
+                <button onClick={async()=>{await stateAction("remove_active",{ticker:ap.candidate});await loadState();}} style={{padding:"6px 8px",background:T.cardHover,border:`1px solid ${T.red}`,borderRadius:4,color:T.red,fontSize:11,cursor:"pointer"}}>✕</button>
               </div>
             </div>);
           })}
 
-          {!scanner&&!scannerLoading&&<div style={{color:T.textDim,fontSize:12,padding:20,textAlign:"center"}}>Loading opportunities...</div>}
-          {scanner&&!scanner.all?.filter(opp=>!positions.some(p=>p.id===opp.ticker)).length&&<div style={{color:T.textDim,fontSize:12,padding:20,textAlign:"center"}}>No non-held opportunities in scanner right now. Auto-refreshes every 5 min.</div>}
+          {/* ═══════════════════════════════════════════ */}
+          {/* APEX SUGGESTION PIPELINE — auto-scanned, R:R validated */}
+          {/* ═══════════════════════════════════════════ */}
+          <div style={{fontSize:11,fontWeight:700,color:T.gold,letterSpacing:1,marginTop:16,marginBottom:6}}>🧠 APEX SUGGESTIONS ({scanner?.passing_rr||0})</div>
+          <div style={{fontSize:9,color:T.textDim,marginBottom:6}}>Auto-scanned every 15 min • R:R ≥ 3:1 filter enforced • Non-held tickers only</div>
 
-          {/* LEGACY MANUAL PIPELINE (if user has curated entries) */}
-          {(state?.pipeline||[]).filter(p=>p.status!=="filled").length>0&&(<>
-            <div style={{fontSize:10,fontWeight:700,color:T.textDim,marginTop:16,marginBottom:6,letterSpacing:1}}>MANUAL PIPELINE (curated)</div>
-            {(state?.pipeline||[]).filter(p=>p.status!=="filled").map((p,i)=>(<div key={"manual-"+i} style={{padding:"8px 10px",background:T.card,borderRadius:8,marginBottom:6,border:`1px solid ${T.border}`}}>
-              <div style={{display:"flex",justifyContent:"space-between"}}>
-                <span style={{fontSize:13,fontWeight:700,color:T.text}}>{p.candidate}</span>
-                <span style={{fontSize:10,color:p.status==="armed"?T.green:T.amber}}>{p.status?.toUpperCase()}</span>
+          {!scanner&&!scannerLoading&&<div style={{color:T.textDim,fontSize:11,padding:"12px",textAlign:"center"}}>Loading opportunities...</div>}
+          {scanner?.top10?.length===0&&<div style={{color:T.textDim,fontSize:11,padding:"12px",textAlign:"center"}}>No opportunities passing R:R filter right now. Next scan in 15 min.</div>}
+
+          {(scanner?.top10||[]).map((opp,i)=>{
+            const s=opp.setup||{};
+            const qGrade=s.quality_grade||"—";
+            const gradeColor=qGrade==="A"?T.green:qGrade==="B"?T.gold:qGrade==="C"?T.amber:T.textDim;
+            const scoreBarWidth=Math.max(5,Math.min(100,opp.score));
+            const inActive=(state?.active_pipeline||[]).some(a=>a.candidate===opp.ticker);
+            const isNew=(scanner?.new_since_last||[]).includes(opp.ticker);
+            return(<div key={opp.ticker} style={{padding:"10px 12px",background:T.card,borderRadius:8,marginBottom:6,border:`1px solid ${inActive?T.green:isNew?T.gold:T.border}`,opacity:inActive?0.6:1}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                <div style={{display:"flex",alignItems:"center",gap:6,flexWrap:"wrap"}}>
+                  <span style={{fontSize:14,fontWeight:700,color:T.text}}>{opp.ticker}</span>
+                  <span style={{padding:"2px 6px",background:gradeColor+"20",color:gradeColor,borderRadius:4,fontSize:10,fontWeight:700}}>Q{qGrade}</span>
+                  <span style={{padding:"2px 6px",background:s.direction==="buy"?T.green+"20":T.red+"20",color:s.direction==="buy"?T.green:T.red,borderRadius:4,fontSize:9,fontWeight:700}}>{s.direction?.toUpperCase()||"—"}</span>
+                  {s.mtf_aligned===true&&<span style={{padding:"2px 6px",background:T.green+"20",color:T.green,borderRadius:4,fontSize:9,fontWeight:700}} title="Multi-timeframe aligned — weekly trend agrees">🟢 MTF</span>}
+                  {s.mtf_aligned===false&&<span style={{padding:"2px 6px",background:T.amber+"20",color:T.amber,borderRadius:4,fontSize:9,fontWeight:700}} title="Daily vs weekly trend disagree">⚠ MTF</span>}
+                  {s.days_to_earnings!=null&&s.days_to_earnings<=14&&<span style={{padding:"2px 6px",background:T.amber+"20",color:T.amber,borderRadius:4,fontSize:9,fontWeight:700}} title="Earnings approaching">📢 EPS {s.days_to_earnings}d</span>}
+                  {isNew&&<span style={{padding:"2px 6px",background:T.gold+"20",color:T.gold,borderRadius:4,fontSize:9,fontWeight:700}}>NEW</span>}
+                  {s.sector_concentrated&&<span style={{padding:"2px 6px",background:T.amber+"20",color:T.amber,borderRadius:4,fontSize:9,fontWeight:700}}>⚠ CONC</span>}
+                  {s.correlation?.warning&&<span style={{padding:"2px 6px",background:T.red+"20",color:T.red,borderRadius:4,fontSize:9,fontWeight:700}} title={s.correlation.warning}>🔗 {s.correlation.sector_count}x {s.correlation.sector}</span>}
+                  {inActive&&<span style={{padding:"2px 6px",background:T.green+"20",color:T.green,borderRadius:4,fontSize:9,fontWeight:700}}>✓ ACTIVE</span>}
+                </div>
+                <div style={{textAlign:"right"}}>
+                  <span style={{fontSize:12,color:gradeColor,fontWeight:700}}>{opp.score}/100</span>
+                  <div style={{fontSize:9,color:T.textDim}}>R:R {s.rr}:1</div>
+                </div>
               </div>
-              <div style={{fontSize:10,color:T.textDim,marginTop:2}}>Slot {p.slot} • {p.day||"TBD"} • {p.thesis||""}</div>
-              <button onClick={()=>{setTab("chat");sendMessage(`Deep dive on ${p.candidate} — full trade construction`);}} style={{marginTop:4,padding:"3px 8px",background:T.cardHover,border:`1px solid ${T.border}`,borderRadius:4,color:T.gold,fontSize:9,cursor:"pointer"}}>Deep Dive →</button>
-            </div>))}
-          </>)}
+              <div style={{marginTop:4,height:3,background:T.cardHover,borderRadius:2,overflow:"hidden"}}>
+                <div style={{width:`${scoreBarWidth}%`,height:"100%",background:gradeColor,borderRadius:2}}/>
+              </div>
+
+              {/* Thesis */}
+              {s.thesis&&<div style={{fontSize:10,color:T.text,marginTop:6,padding:"4px 6px",background:T.cardHover,borderRadius:4,borderLeft:`2px solid ${gradeColor}`,lineHeight:1.4}}>💡 {s.thesis}</div>}
+
+              {/* Trade setup grid */}
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:2,marginTop:6,fontSize:10,fontFamily:T.mono}}>
+                <div><span style={{color:T.textDim}}>Entry:</span> ${fmt(s.entry)}</div>
+                <div><span style={{color:T.textDim}}>Live:</span> <span style={{color:opp.changePct>=0?T.green:T.red}}>${fmt(opp.price)} ({opp.changePct>=0?"+":""}{fmt(opp.changePct,1)}%)</span></div>
+                <div><span style={{color:T.textDim}}>Stop:</span> <span style={{color:T.red}}>${fmt(s.stop)}</span></div>
+                <div><span style={{color:T.textDim}}>T1:</span> <span style={{color:T.green}}>${fmt(s.t1)}</span></div>
+                <div><span style={{color:T.textDim}}>Sector:</span> <span style={{color:T.textDim,fontSize:9}}>{s.sector||"—"}</span></div>
+                <div><span style={{color:T.textDim}}>T2:</span> <span style={{color:T.green}}>${fmt(s.t2)}</span></div>
+              </div>
+
+              {/* Entry trigger */}
+              {s.entry_trigger&&<div style={{fontSize:9,color:T.textDim,marginTop:4,fontStyle:"italic"}}>⚡ {s.entry_trigger}</div>}
+
+              {/* Position sizing */}
+              <div style={{display:"flex",justifyContent:"space-between",marginTop:6,padding:"4px 8px",background:T.cardHover,borderRadius:4,fontSize:10,fontFamily:T.mono}}>
+                <span style={{color:T.textDim}}>Size:</span>
+                <span style={{color:T.text,fontWeight:700}}>{s.suggested_units}u = £{fmt(s.position_value_gbp)}</span>
+                <span style={{color:T.textDim}}>Risk:</span>
+                <span style={{color:s.pct_nav_at_risk>1?T.red:T.green,fontWeight:700}}>£{fmt(s.risk_gbp)} ({fmt(s.pct_nav_at_risk,1)}% NAV)</span>
+              </div>
+
+              <div style={{display:"flex",gap:4,marginTop:8}}>
+                <button onClick={()=>{setTab("chat");sendMessage(`Deep dive on ${opp.ticker}. Quality ${qGrade}, score ${opp.score}/100. Setup: ${s.direction?.toUpperCase()} entry $${s.entry} stop $${s.stop} T1 $${s.t1} T2 $${s.t2} R:R ${s.rr}:1. Position size: ${s.suggested_units}u = £${s.position_value_gbp} (£${s.risk_gbp} at risk, ${s.pct_nav_at_risk}% NAV). Sector: ${s.sector}${s.sector_concentrated?" [CONCENTRATED]":""}. Regime: ${scanner.regime}. Auto-thesis: ${s.thesis}. Give full analysis and verdict: PROMOTE to active pipeline or REJECT.`);}} style={{flex:2,padding:"6px 8px",background:T.cardHover,border:`1px solid ${T.gold}`,borderRadius:4,color:T.gold,fontSize:11,fontWeight:600,cursor:"pointer"}}>🧠 Deep Dive</button>
+                <button onClick={async()=>{const r=await stateAction("promote_to_active",{candidate:opp.ticker,direction:s.direction,entry_price:s.entry,stop:s.stop,t1:s.t1,t2:s.t2,rr:s.rr,score:opp.score,grade:qGrade,sleeve:s.sector==="long_bonds"||s.sector==="gold"||s.sector==="utility_etf"?"Independent":"B",thesis:s.thesis,suggested_units:s.suggested_units,risk_gbp:s.risk_gbp,pct_nav_at_risk:s.pct_nav_at_risk,sector:s.sector,entry_trigger:s.entry_trigger,source:"apex_scan"});if(r?.ok){await loadState();}}} disabled={inActive} style={{flex:1,padding:"6px 8px",background:inActive?T.cardHover:T.green,color:inActive?T.textDim:"#000",fontWeight:700,border:"none",borderRadius:4,fontSize:11,cursor:inActive?"default":"pointer"}}>{inActive?"✓ In Active":"✅ Promote"}</button>
+                <button onClick={async()=>{if(confirm(`Dismiss ${opp.ticker} for 15 min?\n\nWill reappear on next scan if setup still valid.`)){await stateAction("dismiss_suggestion",{ticker:opp.ticker});await loadScanner();}}} title="Hide until next scan" style={{padding:"6px 8px",background:T.cardHover,border:`1px solid ${T.border}`,borderRadius:4,color:T.red,fontSize:11,cursor:"pointer"}}>❌</button>
+              </div>
+            </div>);
+          })}
         </div>)}
 
         {/* ═══ PERFORMANCE TAB ═══ */}
         {tab==="performance"&&(<div style={{padding:"8px 12px"}}>
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
             <span style={{fontSize:14,fontWeight:700,color:T.text}}>Fund Performance</span>
-            <span style={{fontSize:9,color:T.textDim}}>Since 17 Mar 2026</span>
+            <div style={{display:"flex",gap:6,alignItems:"center"}}>
+              <button onClick={()=>setShowDeposit(true)} style={{padding:"4px 10px",background:T.green,color:"#000",fontWeight:700,border:"none",borderRadius:6,fontSize:10,cursor:"pointer"}}>💷 Add Capital</button>
+              <span style={{fontSize:9,color:T.textDim}}>Since 17 Mar 2026</span>
+            </div>
           </div>
 
           {/* REGIME + PEACE BANNER */}
@@ -550,14 +658,20 @@ export default function ApexBrain(){
 
           {/* SOCIAL FEED */}
           {newsSubTab==="social"&&(<>
-            {social.length===0&&<div style={{color:T.textDim,fontSize:12,padding:20,textAlign:"center"}}>Loading social feed...<br/><span style={{fontSize:10}}>Aggregates Trump statements, Hormuz activity, insurance commentary</span></div>}
-            {social.map((s,i)=>(<a key={i} href={s.link||"#"} target="_blank" rel="noopener noreferrer" style={{display:"block",padding:"10px 12px",background:T.card,borderRadius:8,marginBottom:6,border:`1px solid ${T.border}`,textDecoration:"none",overflow:"hidden",wordBreak:"break-word"}}>
-              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4,fontSize:9}}>
-                <span style={{color:T.gold,fontWeight:700,letterSpacing:1}}>{s.source||s.query||"SOCIAL"}</span>
-                {s.date&&<span style={{color:T.textDim}}>{new Date(s.date).toLocaleDateString("en-GB",{day:"2-digit",month:"short"})}</span>}
-              </div>
-              <div style={{fontSize:12,fontWeight:600,color:T.text,lineHeight:1.4,wordBreak:"break-word",overflowWrap:"break-word"}}>{s.title||s.text}</div>
-            </a>))}
+            {social.length===0&&<div style={{color:T.textDim,fontSize:12,padding:20,textAlign:"center"}}>Loading social feed...<br/><span style={{fontSize:10}}>Reddit, StockTwits, Twitter intel</span></div>}
+            {social.map((s,i)=>{
+              const ageH=s.created?Math.floor((Date.now()-new Date(s.created).getTime())/3600000):null;
+              const typeColor=s.type==="reddit"?T.amber:s.type==="stocktwits"?T.green:T.gold;
+              return(<a key={i} href={s.url||"#"} target="_blank" rel="noopener noreferrer" style={{display:"block",padding:"10px 12px",background:T.card,borderRadius:8,marginBottom:6,border:`1px solid ${T.border}`,textDecoration:"none",overflow:"hidden",wordBreak:"break-word"}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4,fontSize:9}}>
+                  <span style={{color:typeColor,fontWeight:700,letterSpacing:1}}>{s.source}</span>
+                  <span style={{color:T.textDim}}>{ageH!=null?(ageH<1?"<1h":ageH<24?`${ageH}h`:`${Math.floor(ageH/24)}d`)+" ago":""}</span>
+                </div>
+                <div style={{fontSize:12,fontWeight:600,color:T.text,lineHeight:1.4,wordBreak:"break-word",overflowWrap:"break-word"}}>{s.title}</div>
+                {s.text&&s.text.length>0&&<div style={{fontSize:10,color:T.textDim,marginTop:4,lineHeight:1.4,wordBreak:"break-word"}}>{s.text.slice(0,200)}{s.text.length>200?"…":""}</div>}
+                {(s.score||s.likes||s.comments)&&<div style={{fontSize:9,color:T.textDim,marginTop:4}}>{s.score!=null?`⬆ ${s.score} `:""}{s.comments!=null?`💬 ${s.comments} `:""}{s.likes!=null?`♥ ${s.likes}`:""}</div>}
+              </a>);
+            })}
           </>)}
         </div>)}
 
@@ -569,29 +683,72 @@ export default function ApexBrain(){
           </div>
 
           {health&&(<>
+            {/* Top-level status cards */}
             <div style={{display:"flex",gap:6,marginBottom:8}}>
               {[{l:"GREEN",v:health.green,c:T.green},{l:"AMBER",v:health.amber,c:T.amber},{l:"RED",v:health.red,c:T.red}].map((s,i)=>(<div key={i} style={{flex:1,padding:"8px",background:T.card,borderRadius:8,textAlign:"center",border:`1px solid ${T.border}`}}>
-                <div style={{fontSize:18,fontWeight:800,color:s.c,fontFamily:T.mono}}>{s.v}</div>
-                <div style={{fontSize:9,color:T.textDim}}>{s.l}</div>
+                <div style={{fontSize:20,fontWeight:800,color:s.c,fontFamily:T.mono}}>{s.v}</div>
+                <div style={{fontSize:9,color:T.textDim,letterSpacing:1}}>{s.l}</div>
               </div>))}
             </div>
 
-            {/* V4 INTELLIGENCE STATUS */}
-            <div style={{padding:"8px 10px",background:T.card,borderRadius:8,marginBottom:6,border:`1px solid ${T.border}`}}>
-              <div style={{fontSize:10,color:T.gold,fontWeight:700,letterSpacing:1,marginBottom:4}}>V4 INTELLIGENCE</div>
-              <div style={{fontSize:10,color:T.text,lineHeight:1.6}}>
-                <div>Regime: <span style={{color:regime?.current?T.green:T.red}}>{regime?.current?.primary_regime||"Not loaded"}</span> {regime?.current?.confidence&&`(${regime.current.confidence}%)`}</div>
-                <div>Peace signal: <span style={{color:peaceSignal?T.green:T.red}}>{peaceSignal?`${peaceSignal.score}/8`:"Not loaded"}</span></div>
-                <div>Scanner: <span style={{color:scanner?T.green:T.textDim}}>{scanner?`${scanner.actionable}/${scanner.scanned} actionable`:"Not loaded"}</span></div>
-                <div>Strategy log: <span style={{color:T.text}}>{health.strategy_log_count||0} entries</span></div>
-                <div>Price errors 24h: <span style={{color:health.price_errors_24h>5?T.red:T.green}}>{health.price_errors_24h||0}</span></div>
+            {/* Runtime telemetry */}
+            <div style={{padding:"10px 12px",background:T.card,borderRadius:8,marginBottom:8,border:`1px solid ${T.gold}`}}>
+              <div style={{fontSize:10,color:T.gold,fontWeight:700,letterSpacing:1,marginBottom:6}}>⚡ RUNTIME</div>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:4,fontSize:11}}>
+                <div><span style={{color:T.textDim}}>Memory:</span> <span style={{color:health.memory_mb>400?T.amber:T.green,fontFamily:T.mono,fontWeight:700}}>{health.memory_mb||0}MB</span></div>
+                <div><span style={{color:T.textDim}}>Uptime:</span> <span style={{color:T.text,fontFamily:T.mono}}>{Math.floor((health.uptime_seconds||0)/3600)}h {Math.floor(((health.uptime_seconds||0)%3600)/60)}m</span></div>
+                <div><span style={{color:T.textDim}}>Node:</span> <span style={{color:T.text,fontFamily:T.mono}}>{health.node_version}</span></div>
+                <div><span style={{color:T.textDim}}>Checks:</span> <span style={{color:T.text,fontFamily:T.mono}}>{health.total}</span></div>
               </div>
             </div>
 
-            {health.checks?.map((c,i)=>(<div key={i} style={{padding:"4px 8px",background:T.card,borderRadius:6,marginBottom:2,border:`1px solid ${T.border}`,display:"flex",justifyContent:"space-between",fontSize:11}}>
-              <span style={{color:T.text}}>{c.status==="GREEN"?"✅":c.status==="AMBER"?"🟡":"🔴"} {c.name}</span>
-              <span style={{color:T.textDim}}>{c.detail}</span>
-            </div>))}
+            {/* Scanner state */}
+            {health.last_scan&&(<div style={{padding:"10px 12px",background:T.card,borderRadius:8,marginBottom:8,border:`1px solid ${T.border}`}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
+                <div style={{fontSize:10,color:T.gold,fontWeight:700,letterSpacing:1}}>🔍 SCANNER</div>
+                <button onClick={async()=>{setScannerLoading(true);await loadScanner();await loadHealth();setScannerLoading(false);}} disabled={scannerLoading} style={{padding:"4px 10px",background:T.gold,color:"#000",fontWeight:700,border:"none",borderRadius:4,fontSize:9,cursor:scannerLoading?"wait":"pointer"}}>{scannerLoading?"⏳ Scanning":"▶ Run Now"}</button>
+              </div>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:4,fontSize:11}}>
+                <div><span style={{color:T.textDim}}>Last run:</span> <span style={{color:T.text,fontFamily:T.mono}}>{health.last_scan.updated?Math.floor((Date.now()-new Date(health.last_scan.updated).getTime())/60000)+"min ago":"—"}</span></div>
+                <div><span style={{color:T.textDim}}>Universe:</span> <span style={{color:T.text,fontFamily:T.mono}}>{health.last_scan.universe_size||"—"}</span></div>
+                <div><span style={{color:T.textDim}}>Scanned:</span> <span style={{color:T.text,fontFamily:T.mono}}>{health.last_scan.scanned||0}</span></div>
+                <div><span style={{color:T.textDim}}>Fetch errors:</span> <span style={{color:health.last_scan.fetch_errors>5?T.red:T.text,fontFamily:T.mono}}>{health.last_scan.fetch_errors||0}</span></div>
+                <div><span style={{color:T.textDim}}>Valid setups:</span> <span style={{color:T.green,fontFamily:T.mono,fontWeight:700}}>{health.last_scan.passing_rr||0}</span></div>
+                <div><span style={{color:T.textDim}}>Rejected R:R:</span> <span style={{color:T.red,fontFamily:T.mono}}>{health.last_scan.rejected_rr||0}</span></div>
+                <div><span style={{color:T.textDim}}>Low conf.:</span> <span style={{color:T.amber,fontFamily:T.mono}}>{health.last_scan.rejected_confidence||0}</span></div>
+                <div><span style={{color:T.textDim}}>Earnings block:</span> <span style={{color:T.textDim,fontFamily:T.mono}}>{health.last_scan.blocked_earnings||0}</span></div>
+                <div><span style={{color:T.textDim}}>Dismissed:</span> <span style={{color:T.textDim,fontFamily:T.mono}}>{health.last_scan.dismissed_count||0}</span></div>
+                <div><span style={{color:T.textDim}}>Self-heal:</span> <span style={{color:health.last_scan.healing_applied?T.amber:T.green,fontFamily:T.mono,fontSize:9}}>{health.last_scan.healing_applied?"ACTIVE":"clean"}</span></div>
+              </div>
+              {health.last_scan.healing_applied&&<div style={{fontSize:9,color:T.amber,marginTop:4,fontStyle:"italic"}}>⚠ {health.last_scan.healing_applied}</div>}
+            </div>)}
+
+            {/* Regime detection */}
+            {health.regime_current&&(<div style={{padding:"10px 12px",background:T.card,borderRadius:8,marginBottom:8,border:`1px solid ${T.border}`}}>
+              <div style={{fontSize:10,color:T.gold,fontWeight:700,letterSpacing:1,marginBottom:6}}>🌐 REGIME</div>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:4,fontSize:11}}>
+                <div><span style={{color:T.textDim}}>Current:</span> <span style={{color:T.gold,fontWeight:700}}>{health.regime_current.primary_code}</span></div>
+                <div><span style={{color:T.textDim}}>Confidence:</span> <span style={{color:T.text,fontFamily:T.mono}}>{health.regime_current.confidence}%</span></div>
+              </div>
+            </div>)}
+
+            {/* Grouped category checks */}
+            {health.grouped&&Object.entries(health.grouped).map(([cat,items])=>{
+              const allGreen=items.every(c=>c.status==="GREEN");
+              const anyRed=items.some(c=>c.status==="RED");
+              const catColor=anyRed?T.red:allGreen?T.green:T.amber;
+              return(<div key={cat} style={{marginBottom:8}}>
+                <div style={{fontSize:10,fontWeight:700,color:catColor,letterSpacing:1,marginBottom:4,padding:"2px 4px"}}>
+                  {anyRed?"🔴":allGreen?"✅":"🟡"} {cat} ({items.length})
+                </div>
+                {items.map((c,i)=>(<div key={i} style={{padding:"5px 10px",background:T.card,borderRadius:4,marginBottom:2,border:`1px solid ${T.border}`,display:"flex",justifyContent:"space-between",fontSize:10}}>
+                  <span style={{color:T.text}}>{c.status==="GREEN"?"✅":c.status==="AMBER"?"🟡":"🔴"} {c.name.split(":")[1]||c.name}</span>
+                  <span style={{color:T.textDim,fontFamily:T.mono,fontSize:9,textAlign:"right",maxWidth:"60%",wordBreak:"break-word"}}>{c.detail}</span>
+                </div>))}
+              </div>);
+            })}
+
+            <div style={{fontSize:8,color:T.textDim,textAlign:"center",marginTop:10,fontStyle:"italic"}}>Refreshed {new Date(health.timestamp).toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit",timeZone:"Europe/London"})} UK</div>
           </>)}
           {!health&&<div style={{color:T.textDim,fontSize:12,padding:20,textAlign:"center"}}>Loading health data...</div>}
         </div>)}
@@ -693,6 +850,42 @@ export default function ApexBrain(){
         })()}
 
         <Btn onClick={executeClose}>{Number(closePos.units)>=closePos.max_units?"🔴 FULL CLOSE":"🟡 PARTIAL CLOSE"}</Btn>
+      </Modal>}
+
+      {showDeposit&&<Modal title="💷 Add Capital to Fund" onClose={()=>{setShowDeposit(false);setDepositAmount("");}}>
+        <div style={{padding:"10px",background:T.card,borderRadius:8,marginBottom:10,border:`1px solid ${T.border}`,fontSize:11}}>
+          <div style={{display:"flex",justifyContent:"space-between",marginBottom:3}}>
+            <span style={{color:T.textDim}}>Current NAV:</span><span style={{color:T.text,fontFamily:T.mono,fontWeight:700}}>£{fmt(account.nav)}</span>
+          </div>
+          <div style={{display:"flex",justifyContent:"space-between",marginBottom:3}}>
+            <span style={{color:T.textDim}}>Total deposited:</span><span style={{color:T.text,fontFamily:T.mono}}>£{fmt(account.total_deposited||0)}</span>
+          </div>
+          <div style={{display:"flex",justifyContent:"space-between"}}>
+            <span style={{color:T.textDim}}>Cash available:</span><span style={{color:T.text,fontFamily:T.mono}}>£{fmt(account.cash||0)}</span>
+          </div>
+        </div>
+
+        <div style={{fontSize:10,color:T.textDim,marginBottom:4,letterSpacing:1}}>QUICK AMOUNTS</div>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:4,marginBottom:8}}>
+          {[100,200,300,500].map(amt=>(
+            <button key={amt} onClick={()=>setDepositAmount(String(amt))} style={{padding:"8px 4px",background:Number(depositAmount)===amt?T.green:T.card,color:Number(depositAmount)===amt?"#000":T.text,border:`1px solid ${Number(depositAmount)===amt?T.green:T.border}`,borderRadius:6,fontSize:11,fontWeight:700,cursor:"pointer"}}>
+              £{amt}
+            </button>
+          ))}
+        </div>
+
+        <Inp p="Amount £" v={depositAmount} c={setDepositAmount} t="number" full/>
+
+        {Number(depositAmount)>0&&<div style={{padding:"8px 10px",background:T.card,borderRadius:8,marginTop:8,marginBottom:8,border:`1px solid ${T.green}`,fontSize:11}}>
+          <div style={{display:"flex",justifyContent:"space-between",marginBottom:2}}>
+            <span style={{color:T.textDim}}>New NAV:</span><span style={{color:T.green,fontFamily:T.mono,fontWeight:700}}>£{fmt(account.nav+Number(depositAmount))}</span>
+          </div>
+          <div style={{display:"flex",justifyContent:"space-between"}}>
+            <span style={{color:T.textDim}}>New total deposited:</span><span style={{color:T.text,fontFamily:T.mono}}>£{fmt((account.total_deposited||0)+Number(depositAmount))}</span>
+          </div>
+        </div>}
+
+        <Btn onClick={submitDeposit}>💷 Add £{depositAmount||"0"} to Fund</Btn>
       </Modal>}
 
       <style>{`@keyframes pulse{0%,80%,100%{transform:scale(0);opacity:.5}40%{transform:scale(1);opacity:1}}`}</style>
