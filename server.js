@@ -130,6 +130,14 @@ cron.schedule("0 8-21 * * 1-5", async () => {
   console.log(`[REGIME] ${d?.current?.primary_code || 'unknown'}`);
 }, { timezone: "Europe/London" });
 
+// 10: AGENTIC PM LOOP (every 15 min during market hours)
+cron.schedule("*/15 8-21 * * 1-5", async () => {
+  const d = await callAPI("/api/agentic", "POST");
+  if (d?.judgments_generated > 0) {
+    console.log(`[AGENTIC] ${d.alerts_detected} alerts, ${d.judgments_generated} judgments sent to Telegram`);
+  }
+}, { timezone: "Europe/London" });
+
 // 10: PEACE SIGNAL (twice daily — 09:00 and 17:00)
 cron.schedule("0 9,17 * * 1-5", async () => {
   const d = await callAPI("/api/altdata?source=peace_signal");
@@ -154,9 +162,14 @@ cron.schedule("0 2 * * *", async () => {
 // START
 app.prepare().then(() => {
   createServer((req, res) => { handle(req, res, parse(req.url, true)); }).listen(port, "0.0.0.0", () => {
-    console.log(`\n🧠 APEX BRAIN V4.6 on port ${port} | ${dev ? "dev" : "production"} | TG: ${TG_TOKEN ? "YES" : "NO"} | 12 crons\n`);
+    console.log(`\n🧠 APEX BRAIN V4.6 CEILING on port ${port} | ${dev ? "dev" : "production"} | TG: ${TG_TOKEN ? "YES" : "NO"} | 13 crons\n`);
     if (TG_TOKEN && TG_CHAT) {
-      tg("🧠 *APEX V4.6 STARTED*\n\n12 crons active:\n• Prices (5min)\n• Risk monitor (5min)\n• Morning brief (07:00)\n• Earnings (12:00)\n• Overnight (21:15)\n• Weekly (Sun 20:00)\n• Scanner (30min)\n• Regime detection (hourly)\n• Peace signal (09:00, 17:00)\n• Strategy engine (06:30)\n• Adaptive learning (02:00)\n• Cleanup (03:00)\n\nType /help for commands");
+      tg("🧠 *APEX V4.6 CEILING STARTED*\n\n13 crons active:\n• Prices (5min)\n• Risk monitor (5min)\n• Agentic PM loop (15min)\n• Morning brief (07:00)\n• Earnings (12:00)\n• Overnight (21:15)\n• Weekly (Sun 20:00)\n• Scanner (30min)\n• Regime detection (hourly)\n• Peace signal (09:00, 17:00)\n• Strategy engine (06:30)\n• Adaptive learning (02:00)\n• Cleanup (03:00)\n\nType /help for commands");
     }
+    // Start Telegram bidirectional polling (works without HTTPS)
+    try {
+      const { startTelegramPolling } = require("./telegramPoll.js");
+      setTimeout(() => startTelegramPolling(), 3000); // delay 3s so routes are ready
+    } catch (e) { console.error("Telegram polling not started:", e.message); }
   });
 });
