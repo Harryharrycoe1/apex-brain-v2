@@ -22,10 +22,25 @@ function parseChatCommand(msg, positions, pipeline) {
   const allTickers = [...new Set([...tickers, ...pipelineTickers])];
 
   // === PIPELINE COMMANDS (check first) ===
+  // "promote X to active", "add X to active pipeline", "activate X"
+  if (/\b(promote|activate)\b/.test(l) || /\bactive\s+pipeline\b/.test(l)) {
+    if (/\bremove\b|\bdelete\b|\bclear\b/.test(l)) {
+      if (/\bclear\b|\ball\b/.test(l)) return { action: "clear_active" };
+      const extraMatch = msg.match(/\b([A-Z]{2,5})\b/g) || [];
+      const valid = extraMatch.filter(t => t !== "APEX" && t !== "NAV");
+      if (valid.length) return { action: "remove_active", ticker: valid[0] };
+    } else {
+      // Promote
+      const extraMatch = msg.match(/\b([A-Z]{2,5})\b/g) || [];
+      const valid = extraMatch.filter(t => t !== "APEX" && t !== "NAV");
+      if (valid.length) return { action: "promote_to_active_chat", ticker: valid[0] };
+    }
+  }
+
   // "remove NVDA from pipeline", "remove MSFT and NVDA from pipeline", "clear pipeline"
-  if (/\b(remove|delete|take\s+off|drop)\b.*\bpipeline\b/.test(l) || /\bpipeline\b.*\b(remove|delete|drop)\b/.test(l)) {
+  if (/\b(remove|delete|clear|take\s+off|drop|wipe)\b.*\bpipeline\b/.test(l) || /\bpipeline\b.*\b(remove|delete|drop|clear)\b/.test(l)) {
     // Clear all
-    if (/\bclear\b|\ball\b|\beverything\b/.test(l)) {
+    if (/\bclear\b|\ball\b|\beverything\b|\bwipe\b/.test(l)) {
       return { action: "clear_pipeline" };
     }
     // Find tickers mentioned (multi-ticker support)
@@ -192,6 +207,59 @@ async function execCmd(cmd) {
       return { ok: true, pipeline_added: t };
     }
 
+    // === ACTIVE PIPELINE ACTIONS ===
+    if (cmd.action === "promote_to_active_chat") {
+      if (!state.active_pipeline) state.active_pipeline = [];
+      const t = cmd.ticker.toUpperCase();
+      if (state.active_pipeline.some(a => (a.candidate || "").toUpperCase() === t)) return { error: t + " already in active pipeline" };
+      // Try to find setup from last scan
+      const scanResult = await fetch(`${url}/get/apex:last_scan`, { headers: { Authorization: `Bearer ${token}` } });
+      let scan = null;
+      if (scanResult.ok) {
+        const sd = await scanResult.json();
+        scan = sd.result;
+        for (let i = 0; i < 3; i++) { if (typeof scan === "string") { try { scan = JSON.parse(scan); } catch { break; } } else break; }
+      }
+      const opp = scan?.top10?.find(o => o.ticker === t);
+      if (!opp?.setup) return { error: t + " not found in last scan. Run a scan first or use the Pipeline tab to promote manually." };
+      state.active_pipeline.push({
+        candidate: t, direction: opp.setup.direction, entry_price: opp.setup.entry, stop: opp.setup.stop,
+        t1: opp.setup.t1, t2: opp.setup.t2, rr: opp.setup.rr, score: opp.score, grade: opp.grade,
+        sleeve: "B", thesis: opp.setup.thesis || "Promoted via chat from APEX scan. Grade " + opp.grade + " (" + opp.score + "/100)",
+        suggested_units: opp.setup.suggested_units, risk_gbp: opp.setup.risk_gbp,
+        pct_nav_at_risk: opp.setup.pct_nav_at_risk, position_value_gbp: opp.setup.position_value_gbp,
+        sector: opp.setup.sector, theme: opp.setup.theme,
+        mtf_aligned: opp.setup.mtf_aligned, entry_trigger: opp.setup.entry_trigger || "",
+        ai_verdict: opp.ai_judgment?.verdict || "", days_to_earnings: opp.setup.days_to_earnings,
+        promoted_at: new Date().toISOString(), source: "chat_promote",
+      });
+      if (!state.strategy_log) state.strategy_log = [];
+      state.strategy_log.push({date:new Date().toISOString(),note:"PROMOTED "+t+" to active pipeline (chat): "+opp.setup.direction.toUpperCase()+" entry $"+opp.setup.entry+" stop $"+opp.setup.stop+" T1 $"+opp.setup.t1+" R:R "+opp.setup.rr+":1",category:"pipeline",author:"PM"});
+      await fetch(`${url}/set/apex:state`,{method:"POST",headers:{Authorization:`Bearer ${token}`,"Content-Type":"application/json"},body:JSON.stringify(state)});
+      return { ok: true, active_promoted: t, setup: opp.setup };
+    }
+
+    if (cmd.action === "remove_active") {
+      if (!state.active_pipeline) state.active_pipeline = [];
+      const t = cmd.ticker.toUpperCase();
+      const before = state.active_pipeline.length;
+      state.active_pipeline = state.active_pipeline.filter(a => (a.candidate || "").toUpperCase() !== t);
+      if (before === state.active_pipeline.length) return { error: t + " not in active pipeline" };
+      if (!state.strategy_log) state.strategy_log = [];
+      state.strategy_log.push({date:new Date().toISOString(),note:"REMOVED "+t+" from active pipeline (chat)",category:"pipeline",author:"PM"});
+      await fetch(`${url}/set/apex:state`,{method:"POST",headers:{Authorization:`Bearer ${token}`,"Content-Type":"application/json"},body:JSON.stringify(state)});
+      return { ok: true, active_removed: t };
+    }
+
+    if (cmd.action === "clear_active") {
+      const before = (state.active_pipeline || []).length;
+      state.active_pipeline = [];
+      if (!state.strategy_log) state.strategy_log = [];
+      state.strategy_log.push({date:new Date().toISOString(),note:"CLEARED active pipeline ("+before+" entries)",category:"pipeline",author:"PM"});
+      await fetch(`${url}/set/apex:state`,{method:"POST",headers:{Authorization:`Bearer ${token}`,"Content-Type":"application/json"},body:JSON.stringify(state)});
+      return { ok: true, active_cleared: before };
+    }
+
     // === POSITION ACTIONS (require ticker lookup) ===
     if (!state?.positions) return null;
     const idx = state.positions.findIndex(p => p.id === cmd.ticker);
@@ -345,6 +413,9 @@ export async function POST(req) {
         if(result.pipeline_removed)msg="\u2705 **Pipeline updated**\nRemoved: "+result.pipeline_removed.join(", ");
         else if(result.pipeline_cleared)msg="\u2705 **Pipeline cleared** ("+result.pipeline_cleared+" entries)";
         else if(result.pipeline_added)msg="\u2705 **Added to pipeline: "+result.pipeline_added+"**";
+        else if(result.active_promoted){const s=result.setup;msg="\u2705 **"+result.active_promoted+" promoted to Active Pipeline**\n"+s.direction.toUpperCase()+" entry $"+s.entry+" | stop $"+s.stop+" | T1 $"+s.t1+" | T2 $"+s.t2+"\nR:R "+s.rr+":1";}
+        else if(result.active_removed)msg="\u2705 **Removed "+result.active_removed+" from Active Pipeline**";
+        else if(result.active_cleared)msg="\u2705 **Active Pipeline cleared** ("+result.active_cleared+" entries)";
         else if(result.changes){msg="\u2705 **"+chatCmd.ticker+" updated**\n"+result.changes.join("\n");}
         else if(result.closed)msg="\u2705 **"+chatCmd.ticker+" closed**\nP&L: \u00a3"+result.pl;
         else if(result.partial)msg="\u2705 **"+chatCmd.ticker+" partially closed**\nRemaining: "+result.remaining+"u\nP&L: \u00a3"+result.pl;
@@ -370,7 +441,7 @@ export async function POST(req) {
     else if(l.match(/deposit|added.*capital|added.*\u00a3|added.*gbp/))pathway="capital_event";
     else if(l.match(/algo|screen|signal|scan|darvas|monte carlo|risk model/))pathway="deep_analysis";
     else regexMatched=false;
-    const tickerRe=userMsg.match(/\b(JPM|BAC|FCX|NVDA|MSFT|MS|SMCI|COPX|EWJ|TLT|CVX|MPC|GLNG|APD|DAL|IAG|LNG|FRO|SPX|BRENT|EQT|UAL|BAE|XOM|LMT|RTX|GD|SLB|HAL)\b/gi);
+    const tickerRe=userMsg.match(/\b(JPM|BAC|FCX|NVDA|MSFT|MS|GS|WFC|C|BK|USB|PNC|SCHW|COF|TFC|AXP|BLK|SMCI|AMD|AVGO|TSM|QCOM|INTC|MU|AMAT|KLAC|LRCX|GOOGL|AMZN|META|ORCL|CRM|PLTR|NOW|COPX|EWJ|FXI|EWU|EWG|EWW|EEM|TLT|IEF|SHY|GLD|SLV|DBC|USO|UNG|VXX|SH|CVX|XOM|COP|OXY|EOG|MPC|PSX|VLO|HES|DVN|SLB|HAL|BKR|NOV|FTI|EQT|AR|CHK|LNG|GLNG|TELL|NFE|APD|LIN|CAT|DE|HON|GE|ETN|PH|XLU|VNQ|KO|PG|WMT|COST|JNJ|PFE|MRK|DAL|UAL|AAL|LUV|ALK|JBLU|SAVE|IAG|LMT|RTX|GD|NOC|HII|BA|TXT|TDG|AVAV|SCCO|BHP|RIO|GDX|GDXJ|NEM|AEM|HL|AA|CENX|FRO|SPX|BRENT|BAE)\b/gi);
     if(tickerRe)entities=[...new Set(tickerRe.map(t=>t.toUpperCase()))];
     if(!regexMatched&&userMsg.length>15){try{const rr=await callClaude(ROUTER_PROMPT,[{role:"user",content:userMsg}],false,200);const p=JSON.parse(rr.text.replace(/```json|```/g,"").trim());pathway=p.pathway||"general";if(Array.isArray(p.entities))entities=[...entities,...p.entities];urgency=p.urgency||"normal";contextNotes=p.context_notes||"";}catch(e){console.error("Router:",e.message);}}
     if(urgency==="CRITICAL")pathway="crisis";if(!PATHWAYS[pathway])pathway="general";await delay(200);
