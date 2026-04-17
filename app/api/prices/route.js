@@ -4,125 +4,168 @@ import { DEFAULT_STATE } from "../../data/fundState.js";
 
 export const maxDuration = 30;
 
-// ═══ KV HELPERS ═══
+// ═══ KV ═══
 async function kvGet(key) {
-  const url = process.env.KV_REST_API_URL;
-  const token = process.env.KV_REST_API_TOKEN;
+  const url = process.env.KV_REST_API_URL, token = process.env.KV_REST_API_TOKEN;
   if (!url || !token) return null;
-  try {
-    const r = await fetch(`${url}/get/${key}`, { headers: { Authorization: `Bearer ${token}` } });
-    if (!r.ok) return null;
-    const d = await r.json();
-    if (d.result === null || d.result === undefined) return null;
-    let val = d.result;
-    // Multi-pass JSON parsing for double-stringified data
-    for (let i = 0; i < 3; i++) {
-      if (typeof val === "string") { try { val = JSON.parse(val); } catch { break; } }
-      else break;
-    }
-    return val;
-  } catch { return null; }
+  try { const r = await fetch(`${url}/get/${key}`, { headers: { Authorization: `Bearer ${token}` } }); if (!r.ok) return null; const d = await r.json(); let v = d.result; for (let i = 0; i < 3; i++) { if (typeof v === "string") { try { v = JSON.parse(v); } catch { break; } } else break; } return v; } catch { return null; }
 }
 
-// ═══ YAHOO FINANCE PRICE FETCHER ═══
-async function fetchYahooPrice(symbol) {
+async function kvSet(key, value) {
+  const url = process.env.KV_REST_API_URL, token = process.env.KV_REST_API_TOKEN;
+  if (!url || !token) return false;
+  try { const r = await fetch(`${url}/set/${key}`, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify(value) }); return r.ok; } catch { return false; }
+}
+
+// ═══ YAHOO FINANCE (PRIMARY) — includes pre/post market ═══
+async function fetchYahoo(symbol) {
   try {
-    const r = await fetch(
-      `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=2d`,
-      { headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" } }
-    );
+    const r = await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=5d&includePrePost=true`, {
+      headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" },
+    });
     if (!r.ok) return null;
     const data = await r.json();
     const meta = data?.chart?.result?.[0]?.meta;
-    if (!meta || meta.regularMarketPrice == null) return null;
-    let price = Number(meta.regularMarketPrice);
-    let prevClose = Number(meta.chartPreviousClose || meta.previousClose) || price;
+    if (!meta) return null;
+
     const isPence = PENCE_SYMBOLS.includes(symbol);
-    if (isPence) { price /= 100; prevClose /= 100; }
+    let price = Number(meta.regularMarketPrice);
+    let prev = Number(meta.chartPreviousClose || meta.previousClose) || price;
+    let preMarket = meta.preMarketPrice ? Number(meta.preMarketPrice) : null;
+    let postMarket = meta.postMarketPrice ? Number(meta.postMarketPrice) : null;
+
+    if (isPence) {
+      price /= 100; prev /= 100;
+      if (preMarket) preMarket /= 100;
+      if (postMarket) postMarket /= 100;
+    }
     if (!isFinite(price)) return null;
-    const change = price - prevClose;
-    const changePct = prevClose ? ((change / prevClose) * 100) : 0;
+
+    // Use the most recent available price
+    const effectivePrice = postMarket || preMarket || price;
+    const changePct = prev ? ((effectivePrice - prev) / prev * 100) : 0;
+
+    // 5d closes for momentum
+    const closes = data?.chart?.result?.[0]?.indicators?.quote?.[0]?.close?.filter(c => c != null) || [];
+
     return {
-      price: Math.round(price * 10000) / 10000,
-      prevClose: Math.round(prevClose * 10000) / 10000,
-      change: Math.round(change * 10000) / 10000,
+      price: Math.round(effectivePrice * 10000) / 10000,
+      regular: Math.round(price * 10000) / 10000,
+      preMarket: preMarket ? Math.round(preMarket * 10000) / 10000 : null,
+      postMarket: postMarket ? Math.round(postMarket * 10000) / 10000 : null,
+      prevClose: Math.round(prev * 10000) / 10000,
       changePct: Math.round(changePct * 100) / 100,
       currency: isPence ? "GBP" : (meta.currency || "USD"),
       marketState: meta.marketState || "UNKNOWN",
+      source: "yahoo",
+      closes5d: isPence ? closes.map(c => c / 100) : closes,
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
+// ═══ FINNHUB BACKUP (free tier: 60 calls/min) ═══
+async function fetchFinnhub(symbol) {
+  const apiKey = process.env.FINNHUB_API_KEY;
+  if (!apiKey) return null;
+  try {
+    const r = await fetch(`https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(symbol)}&token=${apiKey}`);
+    if (!r.ok) return null;
+    const d = await r.json();
+    if (!d.c || d.c === 0) return null;
+    return {
+      price: d.c,
+      prevClose: d.pc || d.c,
+      changePct: d.pc ? Math.round(((d.c - d.pc) / d.pc * 100) * 100) / 100 : 0,
+      high: d.h, low: d.l, open: d.o,
+      source: "finnhub",
+      marketState: "UNKNOWN",
     };
   } catch { return null; }
 }
 
-// ═══ BUILD DYNAMIC TICKER LIST ═══
+// ═══ FETCH WITH FALLBACK ═══
+async function fetchPrice(key, yahooSymbol) {
+  // Try Yahoo first
+  let result = await fetchYahoo(yahooSymbol);
+  if (result) return result;
+
+  // Fallback to Finnhub (US stocks only, different symbol format)
+  if (!yahooSymbol.includes("=") && !yahooSymbol.startsWith("^") && !yahooSymbol.includes(".")) {
+    result = await fetchFinnhub(yahooSymbol);
+    if (result) return result;
+  }
+
+  return null;
+}
+
+// ═══ BUILD TICKER LIST ═══
 function buildTickerList(positions = []) {
   const tickers = {};
+  tickers.BRENT = "BZ=F"; tickers.WTI = "CL=F"; tickers.SPX = "^GSPC";
+  tickers.VIX = "^VIX"; tickers.GBPUSD = "GBPUSD=X";
 
-  // Always include macro indicators
-  tickers.BRENT = "BZ=F";
-  tickers.WTI = "CL=F";
-  tickers.SPX = "^GSPC";
-  tickers.VIX = "^VIX";
-  tickers.GBPUSD = "GBPUSD=X";
-
-  // Add ALL held positions — THIS IS THE KEY V2 FIX
   for (const pos of positions) {
     const id = pos.id?.toUpperCase();
     if (!id) continue;
     const w = WATCHLIST[id];
-    if (w) {
-      tickers[id] = w.yahoo;
-    } else {
-      // Unknown ticker — try direct Yahoo lookup
-      tickers[id] = id;
-    }
+    tickers[id] = w ? w.yahoo : id;
   }
-
-  // Add watchlist tickers that are marked as held
   for (const [key, w] of Object.entries(WATCHLIST)) {
     if (w.held) tickers[key] = w.yahoo;
   }
-
   return tickers;
 }
 
-// ═══ MAIN HANDLER ═══
+// ═══ MAIN ═══
 export async function GET(req) {
-  const authHeader = req.headers.get("x-apex-key");
-  if (authHeader !== process.env.APEX_ACCESS_KEY) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+  const auth = req.headers.get("x-apex-key");
+  if (auth !== process.env.APEX_ACCESS_KEY) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
+  const startTime = Date.now();
   try {
-    // Load current positions from KV to know which tickers to fetch
     const state = await kvGet("apex:state") || DEFAULT_STATE;
     const positions = state?.positions || DEFAULT_STATE.positions || [];
-
-    // Build dynamic ticker list based on held positions
     const tickerMap = buildTickerList(positions);
 
-    // Fetch all prices in batches of 5 (avoid rate limits)
     const results = {};
+    const errors = [];
     const entries = Object.entries(tickerMap);
+
     for (let i = 0; i < entries.length; i += 5) {
       const batch = entries.slice(i, i + 5);
-      await Promise.all(
-        batch.map(([key, sym]) =>
-          fetchYahooPrice(sym).then(d => { if (d) results[key] = d; })
-        )
-      );
+      await Promise.all(batch.map(([key, sym]) =>
+        fetchPrice(key, sym).then(d => {
+          if (d) results[key] = d;
+          else errors.push({ ticker: key, symbol: sym, error: "No data returned" });
+        }).catch(e => errors.push({ ticker: key, symbol: sym, error: e.message }))
+      ));
     }
 
     const now = new Date();
+    const elapsed = Date.now() - startTime;
+
+    // Log errors for health monitoring
+    if (errors.length > 0) {
+      const errorLog = await kvGet("apex:price_errors") || [];
+      errorLog.push({ timestamp: now.toISOString(), errors, elapsed_ms: elapsed });
+      if (errorLog.length > 100) errorLog.splice(0, errorLog.length - 100);
+      await kvSet("apex:price_errors", errorLog);
+    }
+
     return NextResponse.json({
       prices: results,
       timestamp: now.toISOString(),
       uk_time: now.toLocaleTimeString("en-GB", { timeZone: "Europe/London", hour: "2-digit", minute: "2-digit" }),
-      source: "Yahoo Finance",
+      source: "yahoo+finnhub",
       ticker_count: Object.keys(results).length,
       held_count: positions.length,
+      errors: errors.length > 0 ? errors : undefined,
+      elapsed_ms: elapsed,
+      market_state: results.SPX?.marketState || "UNKNOWN",
     });
   } catch (err) {
-    console.error("Prices error:", err);
     return NextResponse.json({ error: err.message }, { status: 500 });
   }
 }
