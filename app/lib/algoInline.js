@@ -64,13 +64,23 @@ function runScreens(positions, prices, account) {
       }
     }
 
-    // S3: R:R deterioration
+    // S3: R:R deterioration — SMART: distinguish good vs bad
     if (pos.stop && pos.t1) {
       const rr = liveRR(lp, pos.stop, pos.t1, dir);
-      if (rr !== null && rr < 1.5) {
-        screens.push({ ticker: pos.id, screen: "RR_DETERIORATED", level: "RED", detail: `R:R now ${$(rr, 1)}:1 — below minimum`, value: rr });
-      } else if (rr !== null && rr < T.min_rr) {
-        screens.push({ ticker: pos.id, screen: "RR_BELOW_MIN", level: "AMBER", detail: `R:R now ${$(rr, 1)}:1 — below 3:1 rule`, value: rr });
+      const profitable = isProfitable(entry, lp, dir);
+      if (rr !== null && rr < T.min_rr) {
+        if (profitable) {
+          // GOOD deterioration — price moved toward T1, compressing R:R naturally
+          // This is the trade WORKING, not a problem. Info only.
+          screens.push({ ticker: pos.id, screen: "RR_COMPRESSED_GOOD", level: "GREEN", detail: `R:R ${$(rr, 1)}:1 — trade working, approaching T1. Rule 8: let it run.`, value: rr });
+        } else {
+          // BAD deterioration — price moved toward stop, T1 getting further away
+          if (rr < 1.5) {
+            screens.push({ ticker: pos.id, screen: "RR_DETERIORATED", level: "RED", detail: `R:R now ${$(rr, 1)}:1 — losing AND poor R:R. Review exit.`, value: rr });
+          } else {
+            screens.push({ ticker: pos.id, screen: "RR_BELOW_MIN", level: "AMBER", detail: `R:R now ${$(rr, 1)}:1 — below 3:1 and position underwater`, value: rr });
+          }
+        }
       }
     }
 
