@@ -14,26 +14,137 @@ const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 function $(v, d = 2) { const n = Number(v); return isFinite(n) ? n.toFixed(d) : "\u2014"; }
 function plPerUnit(e, c, dir) { return (dir === "short" || dir === "sell") ? e - c : c - e; }
 
-// === CHAT COMMAND PARSER ===
-function parseChatCommand(msg, positions) {
-  const l = msg.toLowerCase();
+// === CHAT COMMAND PARSER (V4 — robust natural language) ===
+function parseChatCommand(msg, positions, pipeline) {
+  const l = msg.toLowerCase().trim();
   const tickers = positions.map(p => p.id);
-  const stopM = l.match(/(?:move|set|change|update)\s+(\w+)\s+stop\s+(?:to\s+)?\$?(\d+\.?\d*)/);
-  if (stopM && tickers.includes(stopM[1].toUpperCase())) return { action: "update_position", ticker: stopM[1].toUpperCase(), stop: parseFloat(stopM[2]) };
-  const t1M = l.match(/(?:change|set|update|move)\s+(\w+)\s+t1\s+(?:to\s+)?\$?(\d+\.?\d*)/);
-  if (t1M && tickers.includes(t1M[1].toUpperCase())) return { action: "update_position", ticker: t1M[1].toUpperCase(), t1: parseFloat(t1M[2]) };
-  const t2M = l.match(/(?:change|set|update|move)\s+(\w+)\s+t2\s+(?:to\s+)?\$?(\d+\.?\d*)/);
-  if (t2M && tickers.includes(t2M[1].toUpperCase())) return { action: "update_position", ticker: t2M[1].toUpperCase(), t2: parseFloat(t2M[2]) };
-  const unitsM = l.match(/(?:update|change|set)\s+(\w+)\s+units?\s+(?:to\s+)?(\d+\.?\d*)/);
-  if (unitsM && tickers.includes(unitsM[1].toUpperCase())) return { action: "update_position", ticker: unitsM[1].toUpperCase(), units: parseFloat(unitsM[2]) };
-  const sleeveM = l.match(/(?:switch|move|change)\s+(\w+)\s+(?:to\s+)?sleeve\s+([abc]|independent)/i);
-  if (sleeveM && tickers.includes(sleeveM[1].toUpperCase())) return { action: "update_position", ticker: sleeveM[1].toUpperCase(), sleeve: sleeveM[2].toUpperCase() === "INDEPENDENT" ? "Independent" : sleeveM[2].toUpperCase() };
-  const thesisM = l.match(/(?:change|update|set)\s+(\w+)\s+thesis\s+(?:to\s+)?(.+)/i);
-  if (thesisM && tickers.includes(thesisM[1].toUpperCase())) return { action: "update_position", ticker: thesisM[1].toUpperCase(), thesis: thesisM[2].trim() };
-  const closeM = l.match(/close\s+(\w+)\s+(?:at\s+)?\$?(\d+\.?\d*)/);
-  if (closeM && tickers.includes(closeM[1].toUpperCase())) return { action: "close_position", ticker: closeM[1].toUpperCase(), exit_price: parseFloat(closeM[2]) };
-  const partialM = l.match(/partial(?:ly)?\s+close\s+(\w+)\s+(\d+\.?\d*)\s*u(?:nits?)?\s+(?:at\s+)?\$?(\d+\.?\d*)/);
-  if (partialM && tickers.includes(partialM[1].toUpperCase())) return { action: "partial_close", ticker: partialM[1].toUpperCase(), units: parseFloat(partialM[2]), exit_price: parseFloat(partialM[3]) };
+  const pipelineTickers = (pipeline || []).map(p => (p.candidate || "").toUpperCase()).filter(Boolean);
+  const allTickers = [...new Set([...tickers, ...pipelineTickers])];
+
+  // === PIPELINE COMMANDS (check first) ===
+  // "remove NVDA from pipeline", "remove MSFT and NVDA from pipeline", "clear pipeline"
+  if (/\b(remove|delete|take\s+off|drop)\b.*\bpipeline\b/.test(l) || /\bpipeline\b.*\b(remove|delete|drop)\b/.test(l)) {
+    // Clear all
+    if (/\bclear\b|\ball\b|\beverything\b/.test(l)) {
+      return { action: "clear_pipeline" };
+    }
+    // Find tickers mentioned (multi-ticker support)
+    const foundTickers = [];
+    for (const t of allTickers) {
+      if (new RegExp(`\\b${t.toLowerCase()}\\b`).test(l)) foundTickers.push(t);
+    }
+    // Also check for common tickers not in pipeline yet
+    const extraMatch = msg.match(/\b([A-Z]{2,5})\b/g) || [];
+    for (const t of extraMatch) {
+      if (!foundTickers.includes(t) && t !== "APEX" && t !== "NAV") foundTickers.push(t);
+    }
+    if (foundTickers.length) {
+      return { action: "remove_pipeline_multi", tickers: foundTickers };
+    }
+  }
+
+  // "add X to pipeline", "watch X", "add X pipeline"
+  if (/\b(add|put|watch)\b.*\bpipeline\b/.test(l) || /\bpipeline\b.*\badd\b/.test(l)) {
+    const tMatch = msg.match(/\b([A-Z]{2,5})\b/);
+    if (tMatch) return { action: "add_pipeline", ticker: tMatch[1] };
+  }
+
+  const tickers_set = positions.map(p => p.id);
+
+  // Extract any ticker mentioned in open positions
+  const findTicker = () => {
+    for (const t of tickers_set) {
+      if (new RegExp(`\\b${t.toLowerCase()}\\b`).test(l)) return t;
+    }
+    return null;
+  };
+
+  const ticker = findTicker();
+  if (!ticker) return null;
+
+  const extractNumber = (str) => {
+    const m = str.match(/\$?\s*(\d+(?:\.\d+)?)/);
+    return m ? parseFloat(m[1]) : null;
+  };
+
+  // === CLOSE COMMANDS ===
+  if (/\b(close|exit|sell\s+out|close\s+out|get\s+out\s+of)\b/.test(l) && !/partial/.test(l) && !/pipeline/.test(l)) {
+    const priceMatch = l.match(/(?:at|@|for|price)\s+\$?(\d+\.?\d*)/);
+    return { action: "close_position", ticker, exit_price: priceMatch ? parseFloat(priceMatch[1]) : null };
+  }
+
+  // === PARTIAL CLOSE ===
+  if (/\b(partial|reduce|trim|scale\s+out|partially\s+close)\b/.test(l)) {
+    const unitsMatch = l.match(/(\d+\.?\d*)\s*(?:u|units?|shares?)/);
+    const pctMatch = l.match(/(\d+)\s*%/);
+    const priceMatch = l.match(/(?:at|@|for)\s+\$?(\d+\.?\d*)/);
+
+    if (pctMatch) {
+      // Percentage-based partial close
+      const pct = parseFloat(pctMatch[1]) / 100;
+      const pos = positions.find(p => p.id === ticker);
+      if (pos) {
+        const units = parseFloat((pos.units * pct).toFixed(4));
+        return { action: "partial_close", ticker, units, exit_price: priceMatch ? parseFloat(priceMatch[1]) : null };
+      }
+    }
+    if (unitsMatch) {
+      return { action: "partial_close", ticker, units: parseFloat(unitsMatch[1]), exit_price: priceMatch ? parseFloat(priceMatch[1]) : null };
+    }
+  }
+
+  // === STOP MOVES ===
+  if (/\bstop\b/.test(l) && !/trailing/.test(l)) {
+    const num = extractNumber(l.replace(/\bstop\b/, ""));
+    if (num !== null) return { action: "update_position", ticker, stop: num };
+  }
+
+  if (/\btrailing\s+stop\b/.test(l)) {
+    const num = extractNumber(l.replace(/\btrailing\s+stop\b/, ""));
+    if (num !== null) return { action: "update_position", ticker, trailing_stop: num };
+  }
+
+  const t1Match = l.match(/\b(?:t1|target\s*1|first\s+target)\b/);
+  if (t1Match) {
+    const num = extractNumber(l.replace(/\b(?:t1|target\s*1|first\s+target)\b/, ""));
+    if (num !== null) return { action: "update_position", ticker, t1: num };
+  }
+
+  const t2Match = l.match(/\b(?:t2|target\s*2|second\s+target|final\s+target)\b/);
+  if (t2Match) {
+    const num = extractNumber(l.replace(/\b(?:t2|target\s*2|second\s+target|final\s+target)\b/, ""));
+    if (num !== null) return { action: "update_position", ticker, t2: num };
+  }
+
+  if (/\bunits?\b|\bshares?\b/.test(l)) {
+    const num = extractNumber(l.replace(/\b(units?|shares?)\b/, ""));
+    if (num !== null) return { action: "update_position", ticker, units: num };
+  }
+
+  const sleeveMatch = l.match(/\bsleeve\s+([abc])\b|\bin\s+sleeve\s+([abc])\b|\bto\s+([abc])(?:\s|$)|sleeve\s+(independent)/);
+  if (sleeveMatch) {
+    const sleeve = (sleeveMatch[1] || sleeveMatch[2] || sleeveMatch[3] || sleeveMatch[4] || "").toUpperCase();
+    if (["A", "B", "C", "INDEPENDENT"].includes(sleeve)) {
+      return { action: "update_position", ticker, sleeve: sleeve === "INDEPENDENT" ? "Independent" : sleeve };
+    }
+  }
+
+  const thesisMatch = msg.match(/(?:change|update|set)\s+\w+\s+thesis\s+(?:to\s+|:\s+)?(.+)/i);
+  if (thesisMatch) return { action: "update_position", ticker, thesis: thesisMatch[1].trim() };
+
+  if (/\bconviction\b/.test(l)) {
+    const num = extractNumber(l.replace(/\bconviction\b/, ""));
+    if (num !== null && num >= 1 && num <= 5) return { action: "update_position", ticker, conviction: Math.round(num) };
+  }
+
+  if (/\b(flip|change|make)\b.*\b(to\s+)?(short|long|sell|buy)\b/.test(l)) {
+    const dirMatch = l.match(/\b(short|long|sell|buy)\b/);
+    if (dirMatch) {
+      const dir = dirMatch[1] === "long" ? "buy" : dirMatch[1] === "short" ? "short" : dirMatch[1];
+      return { action: "update_position", ticker, direction: dir };
+    }
+  }
+
   return null;
 }
 
@@ -45,6 +156,43 @@ async function execCmd(cmd) {
     const r = await fetch(`${url}/get/apex:state`, { headers: { Authorization: `Bearer ${token}` } });
     const d = await r.json(); let state = d.result;
     for (let i = 0; i < 3; i++) { if (typeof state === "string") { try { state = JSON.parse(state); } catch { break; } } else break; }
+    if (!state) return null;
+
+    // === PIPELINE ACTIONS (no position lookup needed) ===
+    if (cmd.action === "remove_pipeline_multi") {
+      if (!state.pipeline) state.pipeline = [];
+      const before = state.pipeline.length;
+      const tickersUpper = cmd.tickers.map(t => t.toUpperCase());
+      state.pipeline = state.pipeline.filter(p => !tickersUpper.includes((p.candidate || "").toUpperCase()));
+      const removed = before - state.pipeline.length;
+      if (removed === 0) return { error: "None of [" + cmd.tickers.join(", ") + "] were in pipeline" };
+      if (!state.strategy_log) state.strategy_log = [];
+      state.strategy_log.push({date:new Date().toISOString(),note:"REMOVED from pipeline: "+cmd.tickers.join(", "),category:"pipeline",author:"PM"});
+      await fetch(`${url}/set/apex:state`,{method:"POST",headers:{Authorization:`Bearer ${token}`,"Content-Type":"application/json"},body:JSON.stringify(state)});
+      return { ok: true, pipeline_removed: cmd.tickers };
+    }
+
+    if (cmd.action === "clear_pipeline") {
+      const before = (state.pipeline || []).length;
+      state.pipeline = [];
+      if (!state.strategy_log) state.strategy_log = [];
+      state.strategy_log.push({date:new Date().toISOString(),note:"CLEARED pipeline ("+before+" entries)",category:"pipeline",author:"PM"});
+      await fetch(`${url}/set/apex:state`,{method:"POST",headers:{Authorization:`Bearer ${token}`,"Content-Type":"application/json"},body:JSON.stringify(state)});
+      return { ok: true, pipeline_cleared: before };
+    }
+
+    if (cmd.action === "add_pipeline") {
+      if (!state.pipeline) state.pipeline = [];
+      const t = cmd.ticker.toUpperCase();
+      if (state.pipeline.some(p => (p.candidate || "").toUpperCase() === t)) return { error: t + " already in pipeline" };
+      state.pipeline.push({ candidate: t, slot: state.pipeline.length + 1, status: "watching", thesis: "", day: "" });
+      if (!state.strategy_log) state.strategy_log = [];
+      state.strategy_log.push({date:new Date().toISOString(),note:"ADDED "+t+" to pipeline",category:"pipeline",author:"PM"});
+      await fetch(`${url}/set/apex:state`,{method:"POST",headers:{Authorization:`Bearer ${token}`,"Content-Type":"application/json"},body:JSON.stringify(state)});
+      return { ok: true, pipeline_added: t };
+    }
+
+    // === POSITION ACTIONS (require ticker lookup) ===
     if (!state?.positions) return null;
     const idx = state.positions.findIndex(p => p.id === cmd.ticker);
     if (idx < 0) return { error: cmd.ticker + " not found" };
@@ -52,11 +200,14 @@ async function execCmd(cmd) {
     const changes = [];
     if (cmd.action === "update_position") {
       if (cmd.stop !== undefined) { const dir = (pos.direction||"buy").toLowerCase(); if (pos.stop && ((dir==="buy"&&cmd.stop<pos.stop)||(dir==="short"&&cmd.stop>pos.stop))) return { error: "R1: Cannot move stop against position" }; changes.push("Stop: $"+pos.stop+" -> $"+cmd.stop); pos.stop=cmd.stop; }
+      if (cmd.trailing_stop !== undefined) { changes.push("Trailing: $"+pos.trailing_stop+" -> $"+cmd.trailing_stop); pos.trailing_stop=cmd.trailing_stop; }
       if (cmd.t1 !== undefined) { changes.push("T1: $"+pos.t1+" -> $"+cmd.t1); pos.t1=cmd.t1; }
       if (cmd.t2 !== undefined) { changes.push("T2: $"+pos.t2+" -> $"+cmd.t2); pos.t2=cmd.t2; }
       if (cmd.units !== undefined) { changes.push("Units: "+pos.units+" -> "+cmd.units); pos.units=cmd.units; }
       if (cmd.sleeve !== undefined) { changes.push("Sleeve: "+pos.sleeve+" -> "+cmd.sleeve); pos.sleeve=cmd.sleeve; }
       if (cmd.thesis !== undefined) { changes.push("Thesis updated"); pos.thesis=cmd.thesis; }
+      if (cmd.conviction !== undefined) { changes.push("Conviction: "+pos.conviction+" -> "+cmd.conviction); pos.conviction=cmd.conviction; }
+      if (cmd.direction !== undefined) { changes.push("Direction: "+pos.direction+" -> "+cmd.direction); pos.direction=cmd.direction; }
       state.positions[idx]=pos; state.account.last_updated=new Date().toISOString();
       if (!state.strategy_log) state.strategy_log=[];
       state.strategy_log.push({date:new Date().toISOString(),note:"CHAT EDIT "+cmd.ticker+": "+changes.join(", "),category:"trade_action",author:"PM"});
@@ -65,6 +216,9 @@ async function execCmd(cmd) {
       return { ok:true, changes, position:pos };
     }
     if (cmd.action === "close_position") {
+      if (cmd.exit_price === null || cmd.exit_price === undefined) {
+        return { error: "Please specify exit price. Example: 'close JPM at 315'" };
+      }
       const gbp=Number(state.account?.gbp_usd)||1.34;
       const rawPL=((pos.direction||"buy")==="short"?pos.entry_price-cmd.exit_price:cmd.exit_price-pos.entry_price)*pos.units;
       const plGbp=pos.currency==="GBP"?rawPL:rawPL/gbp;
@@ -77,6 +231,26 @@ async function execCmd(cmd) {
       state.strategy_log.push({date:new Date().toISOString(),note:"CLOSED "+cmd.ticker+" @ $"+cmd.exit_price+" | P&L: "+(plGbp>=0?"+":"")+"\u00a3"+plGbp.toFixed(2),category:"trade_action",author:"PM"});
       await fetch(`${url}/set/apex:state`,{method:"POST",headers:{Authorization:`Bearer ${token}`,"Content-Type":"application/json"},body:JSON.stringify(state)});
       return { ok:true, closed:true, pl:plGbp.toFixed(2) };
+    }
+
+    if (cmd.action === "partial_close") {
+      if (cmd.exit_price === null || cmd.exit_price === undefined) {
+        return { error: "Please specify exit price. Example: 'partial close BAC 1.5u at 54'" };
+      }
+      if (cmd.units >= pos.units) return { error: "Partial close units must be less than position size ("+pos.units+")" };
+      const gbp=Number(state.account?.gbp_usd)||1.34;
+      const rawPL=((pos.direction||"buy")==="short"?pos.entry_price-cmd.exit_price:cmd.exit_price-pos.entry_price)*cmd.units;
+      const plGbp=pos.currency==="GBP"?rawPL:rawPL/gbp;
+      pos.units = pos.units - cmd.units;
+      if (!state.closed) state.closed=[];
+      state.closed.push({id:cmd.ticker+"-partial-"+Date.now(),ticker:cmd.ticker,entry_price:pos.entry_price,exit_price:cmd.exit_price,units:cmd.units,direction:pos.direction,sleeve:pos.sleeve,entry_date:pos.entry_date,exit_date:new Date().toISOString(),net_pl:Math.round(plGbp*100)/100,reason:"Chat partial close",exit_type:"partial"});
+      state.positions[idx]=pos;
+      state.account.total_realised_pl=Math.round(((state.account.total_realised_pl||0)+plGbp)*100)/100;
+      state.account.last_updated=new Date().toISOString();
+      if (!state.strategy_log) state.strategy_log=[];
+      state.strategy_log.push({date:new Date().toISOString(),note:"PARTIAL CLOSE "+cmd.ticker+" "+cmd.units+"u @ $"+cmd.exit_price+" | Remaining: "+pos.units+"u | P&L: "+(plGbp>=0?"+":"")+"\u00a3"+plGbp.toFixed(2),category:"trade_action",author:"PM"});
+      await fetch(`${url}/set/apex:state`,{method:"POST",headers:{Authorization:`Bearer ${token}`,"Content-Type":"application/json"},body:JSON.stringify(state)});
+      return { ok:true, partial:true, remaining:pos.units, pl:plGbp.toFixed(2) };
     }
     return null;
   } catch(e) { return { error:e.message }; }
@@ -162,8 +336,22 @@ export async function POST(req) {
     const kvState=await kvGet("apex:state");
     const fundState=clientState||kvState||DEFAULT_STATE;
     // Chat commands
-    const chatCmd=parseChatCommand(userMsg,fundState.positions||[]);
-    if(chatCmd){const result=await execCmd(chatCmd);if(result?.error)return NextResponse.json({content:"\u274c "+result.error,pathway:"chat_command",urgency:"normal",entities:[chatCmd.ticker],compliance:"CLEAR",knowledge_flags:[]});if(result?.ok){let msg="\u2705 **"+chatCmd.ticker+" updated**\n";if(result.changes)msg+=result.changes.join("\n");if(result.closed)msg+="Position closed. P&L: \u00a3"+result.pl;return NextResponse.json({content:msg,pathway:"chat_command",urgency:"normal",entities:[chatCmd.ticker],compliance:"CLEAR",knowledge_flags:[],state_changed:true});}}
+    const chatCmd=parseChatCommand(userMsg,fundState.positions||[],fundState.pipeline||[]);
+    if(chatCmd){
+      const result=await execCmd(chatCmd);
+      if(result?.error)return NextResponse.json({content:"\u274c "+result.error,pathway:"chat_command",urgency:"normal",entities:[chatCmd.ticker||chatCmd.tickers?.[0]||""],compliance:"CLEAR",knowledge_flags:[]});
+      if(result?.ok){
+        let msg="";
+        if(result.pipeline_removed)msg="\u2705 **Pipeline updated**\nRemoved: "+result.pipeline_removed.join(", ");
+        else if(result.pipeline_cleared)msg="\u2705 **Pipeline cleared** ("+result.pipeline_cleared+" entries)";
+        else if(result.pipeline_added)msg="\u2705 **Added to pipeline: "+result.pipeline_added+"**";
+        else if(result.changes){msg="\u2705 **"+chatCmd.ticker+" updated**\n"+result.changes.join("\n");}
+        else if(result.closed)msg="\u2705 **"+chatCmd.ticker+" closed**\nP&L: \u00a3"+result.pl;
+        else if(result.partial)msg="\u2705 **"+chatCmd.ticker+" partially closed**\nRemaining: "+result.remaining+"u\nP&L: \u00a3"+result.pl;
+        else msg="\u2705 Done";
+        return NextResponse.json({content:msg,pathway:"chat_command",urgency:"normal",entities:[chatCmd.ticker||chatCmd.tickers?.[0]||""],compliance:"CLEAR",knowledge_flags:[],state_changed:true});
+      }
+    }
     const serverPrices=await loadPrices(fundState.positions||[]);
     const mergedPrices={...serverPrices,...(clientPrices||{})};
     const algoOutput=runAlgoEngine(fundState.positions||[],mergedPrices,fundState.account);
