@@ -70,24 +70,35 @@ function runScreens(positions, prices, account) {
       if (hasTrailing) {
         // Trailing stop breach check (sd <= 0 means price has crossed the stop)
         if (sd !== null && sd <= 0) {
+          const curr = pos.currency === "GBP" ? "£" : "$";
           screens.push({
             ticker: pos.id,
             screen: "TRAILING_STOP_BREACHED",
             level: "RED",
-            detail: `Trailing stop BREACHED at $${effectiveStop} — close manually on T212. Live $${$(lp)}`,
+            detail: `Trailing stop BREACHED at ${curr}${effectiveStop} — close manually on T212. Live ${curr}${$(lp)}`,
             value: sd,
           });
         } else if (sd !== null) {
           // Active trailing — informational green, no warning levels
-          const pctStr = pos.trailing_stop_pct ? ` (trails ${pos.trailing_stop_pct}%)` : "";
-          const hwmStr = pos.trailing_stop_hwm ? ` | HWM $${$(pos.trailing_stop_hwm)}` : "";
+          const mode = pos.trailing_stop_mode || (pos.trailing_stop_distance != null ? "distance" : pos.trailing_stop_pct != null ? "pct" : null);
+          const curr = pos.currency === "GBP" ? "£" : "$";
+          // Show both distance and pct in the info line
+          let modeStr = "";
+          if (mode === "distance" && pos.trailing_stop_distance != null) {
+            const effPct = pos.trailing_stop_hwm > 0 ? ((pos.trailing_stop_hwm - effectiveStop) / pos.trailing_stop_hwm * 100).toFixed(1) : null;
+            modeStr = ` (trails ${curr}${pos.trailing_stop_distance}${effPct ? ` / ${effPct}%` : ""})`;
+          } else if (mode === "pct" && pos.trailing_stop_pct != null) {
+            const effDist = pos.trailing_stop_hwm != null ? Math.abs(pos.trailing_stop_hwm - effectiveStop).toFixed(2) : null;
+            modeStr = ` (trails ${pos.trailing_stop_pct}%${effDist ? ` / ${curr}${effDist}` : ""})`;
+          }
+          const hwmStr = pos.trailing_stop_hwm ? ` | HWM ${curr}${$(pos.trailing_stop_hwm)}` : "";
           const profitPerUnit = plPerUnit(entry, effectiveStop, dir);
-          const lockedIn = profitPerUnit > 0 ? `locked +$${$(profitPerUnit)}/u` : `stop at breakeven`;
+          const lockedIn = profitPerUnit > 0 ? `locked +${curr}${$(profitPerUnit)}/u` : `stop at breakeven`;
           screens.push({
             ticker: pos.id,
             screen: "TRAILING_ACTIVE",
             level: "GREEN",
-            detail: `🔒 Trailing at $${$(effectiveStop)}${pctStr}${hwmStr} — ${lockedIn}`,
+            detail: `🔒 Trailing at ${curr}${$(effectiveStop)}${modeStr}${hwmStr} — ${lockedIn}`,
             value: sd,
           });
         }
