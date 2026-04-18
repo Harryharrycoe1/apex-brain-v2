@@ -212,21 +212,53 @@ export async function POST(req) {
           changes.push(`Trailing: $${pos.trailing_stop || "—"} → $${newTS || "—"}`);
           pos.trailing_stop = newTS;
         }
-        // V5.1: trailing stop configuration
-        if (body.trailing_stop_pct !== undefined) {
-          const newPct = body.trailing_stop_pct === "" || body.trailing_stop_pct === null ? null : Number(body.trailing_stop_pct);
-          if (newPct === null) {
-            // Disabling trailing — clear all trailing fields
-            changes.push(`🔓 Trailing DISABLED (was ${pos.trailing_stop_pct}%)`);
+        // V5.1: dual-mode trailing stop config (distance OR pct)
+        // Setting trailing_stop_mode to null disables trailing entirely.
+        if (body.trailing_stop_mode !== undefined) {
+          const newMode = body.trailing_stop_mode === "" || body.trailing_stop_mode === null ? null : String(body.trailing_stop_mode);
+          if (newMode === null) {
+            // Disabling — clear all trailing fields
+            changes.push(`🔓 Trailing DISABLED (was mode=${pos.trailing_stop_mode || "unset"})`);
+            pos.trailing_stop_mode = null;
+            pos.trailing_stop_distance = null;
             pos.trailing_stop_pct = null;
             pos.trailing_stop = null;
             pos.trailing_stop_hwm = null;
             pos.trailing_stop_activated = null;
             pos.trailing_stop_last_update = null;
+          } else if (newMode === "distance" || newMode === "pct") {
+            if (pos.trailing_stop_mode !== newMode) changes.push(`Trail mode: ${pos.trailing_stop_mode || "unset"} → ${newMode}`);
+            pos.trailing_stop_mode = newMode;
+            // Switching modes — clear opposite field and reset HWM so worker rebuilds
+            if (newMode === "distance") pos.trailing_stop_pct = null;
+            if (newMode === "pct") pos.trailing_stop_distance = null;
+            if (!pos.trailing_stop_activated) pos.trailing_stop_activated = new Date().toISOString();
+          }
+        }
+        if (body.trailing_stop_distance !== undefined) {
+          const newDist = body.trailing_stop_distance === "" || body.trailing_stop_distance === null ? null : Number(body.trailing_stop_distance);
+          if (newDist === null) {
+            if (pos.trailing_stop_distance != null) changes.push("🔓 Trail distance cleared");
+            pos.trailing_stop_distance = null;
           } else {
-            changes.push(`🔒 Trailing: ${pos.trailing_stop_pct || "off"}% → ${newPct}%`);
+            changes.push(`🔒 Trail distance: $${pos.trailing_stop_distance || "—"} → $${newDist}`);
+            pos.trailing_stop_distance = newDist;
+            if (!pos.trailing_stop_mode) pos.trailing_stop_mode = "distance";
+            if (!pos.trailing_stop_activated) {
+              pos.trailing_stop_hwm = null;
+              pos.trailing_stop_activated = new Date().toISOString();
+            }
+          }
+        }
+        if (body.trailing_stop_pct !== undefined) {
+          const newPct = body.trailing_stop_pct === "" || body.trailing_stop_pct === null ? null : Number(body.trailing_stop_pct);
+          if (newPct === null) {
+            if (pos.trailing_stop_pct != null) changes.push("🔓 Trail pct cleared");
+            pos.trailing_stop_pct = null;
+          } else {
+            changes.push(`🔒 Trail pct: ${pos.trailing_stop_pct || "off"}% → ${newPct}%`);
             pos.trailing_stop_pct = newPct;
-            // If enabling for first time, clear HWM so worker initializes on next tick
+            if (!pos.trailing_stop_mode) pos.trailing_stop_mode = "pct";
             if (!pos.trailing_stop_activated) {
               pos.trailing_stop_hwm = null;
               pos.trailing_stop_activated = new Date().toISOString();
