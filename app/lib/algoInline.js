@@ -1,5 +1,10 @@
-// APEX BRAIN V5.0 — ALGO INLINE (Tiers 1-3)
+// APEX BRAIN V5.1 — ALGO INLINE (Tiers 1-3)
 // Runs inline with chat route. Provides real-time risk screens + signals.
+//
+// V5.1 CHANGES:
+// - S1 is trailing-stop-aware: when pos.trailing_stop is set, STOP_WARN/CRITICAL
+//   alerts are suppressed and replaced with a green TRAILING_ACTIVE info line.
+//   TRAILING_STOP_BREACHED (RED) fires if live price crosses the trailing stop.
 //
 // V5.0 FIX (S2): Import canonical SECTOR_MAP from scannerAdvanced.js instead of
 // hardcoded 25-ticker subset. Previous version's correlation audit was wrong for
@@ -52,13 +57,47 @@ function runScreens(positions, prices, account) {
     const entry = Number(pos.entry_price);
     const units = Number(pos.units);
 
-    // S1: Stop proximity
-    if (pos.stop) {
-      const sd = stopDistPct(lp, pos.stop, dir);
-      if (sd !== null && sd < T.stop_proximity_critical) {
-        screens.push({ ticker: pos.id, screen: "STOP_CRITICAL", level: "RED", detail: `${$(sd, 1)}% from stop ($${pos.stop})`, value: sd });
-      } else if (sd !== null && sd < T.stop_proximity_warn) {
-        screens.push({ ticker: pos.id, screen: "STOP_WARN", level: "AMBER", detail: `${$(sd, 1)}% from stop ($${pos.stop})`, value: sd });
+    // S1: Stop proximity — V5.1: trailing-stop-aware
+    // If position has trailing_stop, use it as the effective stop.
+    // Regular STOP_WARN/STOP_CRITICAL suppressed in favor of TRAILING_ACTIVE info line.
+    // BUT if trailing stop is breached, fire RED TRAILING_STOP_BREACHED.
+    const hasTrailing = pos.trailing_stop != null && Number.isFinite(Number(pos.trailing_stop));
+    const effectiveStop = hasTrailing ? Number(pos.trailing_stop) : pos.stop;
+
+    if (effectiveStop) {
+      const sd = stopDistPct(lp, effectiveStop, dir);
+
+      if (hasTrailing) {
+        // Trailing stop breach check (sd <= 0 means price has crossed the stop)
+        if (sd !== null && sd <= 0) {
+          screens.push({
+            ticker: pos.id,
+            screen: "TRAILING_STOP_BREACHED",
+            level: "RED",
+            detail: `Trailing stop BREACHED at $${effectiveStop} — close manually on T212. Live $${$(lp)}`,
+            value: sd,
+          });
+        } else if (sd !== null) {
+          // Active trailing — informational green, no warning levels
+          const pctStr = pos.trailing_stop_pct ? ` (trails ${pos.trailing_stop_pct}%)` : "";
+          const hwmStr = pos.trailing_stop_hwm ? ` | HWM $${$(pos.trailing_stop_hwm)}` : "";
+          const profitPerUnit = plPerUnit(entry, effectiveStop, dir);
+          const lockedIn = profitPerUnit > 0 ? `locked +$${$(profitPerUnit)}/u` : `stop at breakeven`;
+          screens.push({
+            ticker: pos.id,
+            screen: "TRAILING_ACTIVE",
+            level: "GREEN",
+            detail: `🔒 Trailing at $${$(effectiveStop)}${pctStr}${hwmStr} — ${lockedIn}`,
+            value: sd,
+          });
+        }
+      } else {
+        // Regular stop — original warning logic
+        if (sd !== null && sd < T.stop_proximity_critical) {
+          screens.push({ ticker: pos.id, screen: "STOP_CRITICAL", level: "RED", detail: `${$(sd, 1)}% from stop ($${pos.stop})`, value: sd });
+        } else if (sd !== null && sd < T.stop_proximity_warn) {
+          screens.push({ ticker: pos.id, screen: "STOP_WARN", level: "AMBER", detail: `${$(sd, 1)}% from stop ($${pos.stop})`, value: sd });
+        }
       }
     }
 
