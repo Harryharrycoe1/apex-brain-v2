@@ -35,9 +35,23 @@ async function callAPI(path, method = "GET", body = null) {
 cron.schedule("*/5 8-21 * * 1-5", async () => {
   const d = await callAPI("/api/prices");
   if (d) console.log(`[PRICES] ${d.ticker_count} tickers`);
+  // V5.1: Fire Telegram breach alerts from trailing_updates surfaced by /api/prices
+  if (d?.trailing_updates?.length) {
+    for (const u of d.trailing_updates) {
+      if (u.breached) {
+        await tg(`🚨 *TRAILING STOP BREACHED — ${u.ticker}*\nPrice crossed $${u.new_stop}\n⚠️ CLOSE MANUALLY ON T212 NOW`);
+      } else if (u.advanced && u.old_stop) {
+        // Silent advance — only log, no Telegram spam every tick
+        console.log(`[TRAIL] ${u.ticker} advanced $${u.old_stop} → $${u.new_stop}`);
+      }
+    }
+  }
 }, { timezone: "Europe/London" });
 
 // 2: RISK MONITOR (5min US hours)
+// V5.1: Skip STOP_WARN/CRITICAL alerts for positions with active trailing stop —
+// trailing stops are intentionally close to price to lock profit, so the old
+// proximity alerts become noise. Trailing breach alerts fire from cron 1 above.
 cron.schedule("*/5 14-21 * * 1-5", async () => {
   const state = await callAPI("/api/state");
   const prices = await callAPI("/api/prices");
@@ -45,9 +59,14 @@ cron.schedule("*/5 14-21 * * 1-5", async () => {
   for (const pos of state.state.positions) {
     const lp = prices?.prices?.[pos.id]?.price;
     if (!lp || !pos.stop) continue;
-    const sd = Math.abs((lp - pos.stop) / lp * 100);
-    if (sd < 3) await tg(`🔴 *CRITICAL — ${pos.id}*\nPrice: $${lp} | Stop: $${pos.stop} | ${sd.toFixed(1)}%`);
-    else if (sd < 5) await tg(`🟡 *WARNING — ${pos.id}*\nPrice: $${lp} | Stop: $${pos.stop} | ${sd.toFixed(1)}%`);
+    // V5.1: Skip traditional stop alerts if trailing stop is active
+    const hasTrailing = pos.trailing_stop != null && pos.trailing_stop_pct != null;
+    if (!hasTrailing) {
+      const sd = Math.abs((lp - pos.stop) / lp * 100);
+      if (sd < 3) await tg(`🔴 *CRITICAL — ${pos.id}*\nPrice: $${lp} | Stop: $${pos.stop} | ${sd.toFixed(1)}%`);
+      else if (sd < 5) await tg(`🟡 *WARNING — ${pos.id}*\nPrice: $${lp} | Stop: $${pos.stop} | ${sd.toFixed(1)}%`);
+    }
+    // T1 alert fires regardless of trailing status
     if (pos.t1 && Math.abs((pos.t1 - lp) / lp * 100) < 3) await tg(`🟢 *T1 NEAR — ${pos.id}*\n$${lp} → T1: $${pos.t1}`);
   }
 }, { timezone: "Europe/London" });
