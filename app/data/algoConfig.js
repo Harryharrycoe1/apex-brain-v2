@@ -1,5 +1,9 @@
-// APEX BRAIN V2 — ALGO CONFIG
+// APEX BRAIN V5.0 — ALGO CONFIG
 // Watchlist, earnings, thresholds for algo engine + scanner
+//
+// V5.0 NOTE: EARNINGS_CALENDAR is kept but status fields updated to reflect
+// reality (Apr 15/16 earnings already passed). Scanner fetches earnings
+// dates live from Yahoo quoteSummary, so this constant is advisory only.
 
 export const WATCHLIST = {
   // === HELD POSITIONS ===
@@ -45,13 +49,15 @@ export const WATCHLIST = {
 // Pence-denominated symbols (divide by 100)
 export const PENCE_SYMBOLS = ["IAG.L", "BAE.L"];
 
+// V5.0: Advisory only — scanner uses live Yahoo quoteSummary for real earnings dates.
+// Status flipped to "passed" for dates before today's date.
 export const EARNINGS_CALENDAR = [
-  { ticker: "BAC", date: "2026-04-15", consensus_eps: 1.00, status: "upcoming" },
-  { ticker: "MS", date: "2026-04-16", consensus_eps: 2.20, status: "upcoming" },
-  { ticker: "JPM", date: "2026-04-15", consensus_eps: 5.41, status: "upcoming" },
+  { ticker: "JPM", date: "2026-04-15", consensus_eps: 5.41, status: "passed" },
+  { ticker: "BAC", date: "2026-04-15", consensus_eps: 1.00, status: "passed" },
+  { ticker: "MS",  date: "2026-04-16", consensus_eps: 2.20, status: "passed" },
+  { ticker: "CVX", date: "2026-04-24", consensus_eps: null, status: "upcoming" },
+  { ticker: "APD", date: "2026-04-29", consensus_eps: null, status: "upcoming" },
   { ticker: "NVDA", date: "2026-05-28", consensus_eps: null, status: "watching" },
-  { ticker: "CVX", date: "2026-04-24", consensus_eps: null, status: "watching" },
-  { ticker: "APD", date: "2026-04-29", consensus_eps: null, status: "watching" },
 ];
 
 export const ALGO_THRESHOLDS = {
