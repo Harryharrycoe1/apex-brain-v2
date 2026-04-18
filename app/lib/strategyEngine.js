@@ -1,6 +1,9 @@
-// APEX BRAIN V4.6 — MULTI-STRATEGY ENGINE
+// APEX BRAIN V5.0 — MULTI-STRATEGY ENGINE
 // Beyond directional CFDs: pairs, hedges, drift, regime-conditional strategies
-// Strategy selector picks which fits current regime + opportunity
+// V5.0 FIX S1: now imports unified SECTOR_MAP from scannerAdvanced.js instead of
+// maintaining a 20-ticker hardcoded subset that disagreed with the scanner.
+
+import { SECTOR_MAP } from "./scannerAdvanced.js";
 
 // ═══ STRATEGY DEFINITIONS ═══
 export const STRATEGIES = {
@@ -38,7 +41,7 @@ export const STRATEGIES = {
   },
   STRUCTURAL_LONG: {
     name: "Structural Long",
-    description: "Multi-month thesis with macro tailwind (e.g. helium scarcity, energy transition)",
+    description: "Multi-month thesis with macro tailwind",
     best_regime: ["ANY"],
     risk_profile: "MEDIUM",
     typical_hold: "60-365 days",
@@ -55,28 +58,48 @@ export const STRATEGIES = {
   VOLATILITY_HEDGE: {
     name: "Volatility Hedge",
     description: "Long VIX or VIX futures via UVXY when complacency extreme",
-    best_regime: ["GOLDILOCKS"], // When VIX is too low
+    best_regime: ["GOLDILOCKS"],
     risk_profile: "HIGH",
     typical_hold: "5-15 days",
     sleeve: "A",
   },
 };
 
+// ═══ SECTOR ALIASING ═══
+// Scanner's SECTOR_MAP uses specific labels (e.g. "Banks", "Semis", "Energy").
+// Let user query a broader label like "Financial" and map to multiple scanner sectors.
+const SECTOR_ALIASES = {
+  Financial: ["Banks", "Brokers", "AssetMgr", "Consumer"],
+  Technology: ["Tech", "Semis"],
+  Tech: ["Tech", "Semis"],
+  Energy: ["Energy"],
+  EnergyServices: ["EnergyServices"],
+  LNG: ["LNG", "NatGas"],
+  Defence: ["Defence"],
+  Airlines: ["Airlines"],
+  Materials: ["Copper", "Mining", "GoldMiners", "Aluminum"],
+  Gold: ["Gold", "GoldMiners"],
+  Industrial: ["Industrial", "IndGas"],
+  Banks: ["Banks"],
+  Semis: ["Semis"],
+};
+
+function tickersInSector(label) {
+  const targetSectors = SECTOR_ALIASES[label] || [label];
+  const result = [];
+  for (const [ticker, sector] of Object.entries(SECTOR_MAP)) {
+    if (targetSectors.includes(sector)) result.push(ticker);
+  }
+  return result;
+}
+
 // ═══ PAIRS TRADE FINDER ═══
-// Find long-strong + short-weak in same sector
 export function findPairsTrade(scannerResults, sector) {
   if (!scannerResults?.length) return null;
 
-  // Filter by sector (using ticker mapping)
-  const sectorMap = {
-    Financial: ["JPM", "BAC", "MS", "GS", "WFC", "C"],
-    Technology: ["NVDA", "MSFT", "AAPL", "GOOG", "META", "AMD", "AVGO", "SMCI"],
-    Energy: ["MPC", "CVX", "XOM", "SLB", "HAL"],
-    Materials: ["FCX", "COPX", "GDX"],
-    Airlines: ["DAL", "UAL", "AAL", "IAG"],
-  };
+  const sectorTickers = tickersInSector(sector);
+  if (sectorTickers.length < 2) return null;
 
-  const sectorTickers = sectorMap[sector] || [];
   const sectorScores = scannerResults.filter(r => sectorTickers.includes(r.ticker));
   if (sectorScores.length < 2) return null;
 
@@ -84,14 +107,16 @@ export function findPairsTrade(scannerResults, sector) {
   const long = sorted[0];
   const short = sorted[sorted.length - 1];
 
-  if (long.score - short.score < 20) return null; // Need meaningful divergence
+  // Need meaningful divergence
+  if (long.score - short.score < 20) return null;
 
   return {
     strategy: "PAIRS_TRADE",
     sector,
-    long_leg: { ticker: long.ticker, score: long.score, grade: long.grade },
-    short_leg: { ticker: short.ticker, score: short.score, grade: short.grade },
+    long_leg: { ticker: long.ticker, score: long.score, grade: long.grade, sector: SECTOR_MAP[long.ticker] },
+    short_leg: { ticker: short.ticker, score: short.score, grade: short.grade, sector: SECTOR_MAP[short.ticker] },
     score_spread: parseFloat((long.score - short.score).toFixed(1)),
+    candidates_considered: sectorScores.length,
     rationale: `Long ${long.ticker} (${long.score}) / Short ${short.ticker} (${short.score}) — market-neutral exposure to ${sector} dispersion`,
     typical_size: "5-8% NAV combined (long + short notional)",
     risk_management: "Stop both legs if pair correlation breaks or score spread inverts",
@@ -130,9 +155,7 @@ export function findCrossAssetHedge(regimeCode) {
 }
 
 // ═══ EARNINGS DRIFT SCREENER ═══
-// Identifies companies that recently beat earnings — drift typically continues 20-60 days
 export function screenEarningsDrift(positions, earningsCalendar) {
-  // earningsCalendar = [{ ticker, date, surprise_pct, eps_actual, eps_expected }]
   if (!earningsCalendar?.length) return [];
 
   const candidates = [];
@@ -142,11 +165,9 @@ export function screenEarningsDrift(positions, earningsCalendar) {
     const earningsDate = new Date(earnings.date).getTime();
     const daysSince = (now - earningsDate) / 86400000;
 
-    // PEAD window: 1-30 days post earnings
     if (daysSince < 1 || daysSince > 30) continue;
-    if (!earnings.surprise_pct || earnings.surprise_pct < 5) continue; // Need meaningful beat
+    if (!earnings.surprise_pct || earnings.surprise_pct < 5) continue;
 
-    // Skip if already held
     if (positions.some(p => p.id === earnings.ticker)) continue;
 
     candidates.push({
@@ -165,12 +186,11 @@ export function screenEarningsDrift(positions, earningsCalendar) {
 }
 
 // ═══ STRATEGY SELECTOR ═══
-// Given current regime + opportunity set, recommend optimal strategy mix
 export function selectStrategies(regimeCode, scannerResults, positions, earningsCalendar = []) {
   const recommendations = [];
 
-  // Always include directional opportunities from scanner
-  const topDirectional = scannerResults?.slice(0, 3) || [];
+  // Directional: top 3 from scanner (if actionable)
+  const topDirectional = (scannerResults || []).slice(0, 3);
   for (const opp of topDirectional) {
     if (opp.actionable) {
       recommendations.push({
@@ -194,22 +214,27 @@ export function selectStrategies(regimeCode, scannerResults, positions, earnings
     });
   }
 
-  // Pairs trades in dominant sectors
-  const sectorsToCheck = regimeCode === "GOLDILOCKS" ? ["Technology", "Financial"]
-                       : regimeCode === "REFLATION" ? ["Energy", "Materials"]
-                       : ["Energy", "Financial"];
+  // Pairs trades in regime-relevant sectors
+  // V5.0: use full scanner sector labels
+  const sectorsByRegime = {
+    GOLDILOCKS: ["Tech", "Semis", "Banks"],
+    REFLATION: ["Energy", "EnergyServices", "Materials"],
+    STAGFLATION: ["Energy", "Gold", "Materials"],
+    DEFLATION: ["Banks", "Industrial"],
+  };
+  const sectorsToCheck = sectorsByRegime[regimeCode] || ["Energy", "Banks"];
   for (const sector of sectorsToCheck) {
     const pair = findPairsTrade(scannerResults, sector);
     if (pair) recommendations.push(pair);
   }
 
-  // Earnings drift opportunities
+  // Earnings drift
   const drift = screenEarningsDrift(positions, earningsCalendar);
   for (const d of drift.slice(0, 2)) {
     recommendations.push(d);
   }
 
-  // Defensive overlay if STAGFLATION/DEFLATION
+  // Defensive overlay if stagflation/deflation
   if (regimeCode === "DEFLATION" || regimeCode === "STAGFLATION") {
     recommendations.push({
       strategy: "DEFENSIVE_HEDGE",
