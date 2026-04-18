@@ -67,40 +67,53 @@ export async function GET(req) {
     scanAgeMin > 30 ? warn("SCANNER:last_run", `${scanAgeMin}min ago`) : pass("SCANNER:last_run", `${scanAgeMin}min ago`);
     pass("SCANNER:universe", `${lastScan.universe_size || 0} tickers`);
     pass("SCANNER:passing_rr", `${lastScan.passing_rr || 0} valid setups`);
+    if (lastScan.ai_judgments != null) pass("SCANNER:ai_judge", `${lastScan.ai_judgments} judged, ${lastScan.ai_vetoes || 0} vetoed, ${lastScan.ai_errors || 0} errors`);
+    // V5.0: flag if bad data is being detected
+    if (lastScan.suspect_data_tickers?.length) warn("SCANNER:suspect_data", `${lastScan.suspect_data_tickers.length} tickers flagged: ${lastScan.suspect_data_tickers.slice(0, 5).join(", ")}`);
     lastScan.rejected_rr > 0 && pass("SCANNER:rejected_rr", `${lastScan.rejected_rr} rejected on R:R`);
   } else { warn("SCANNER:state", "Not run yet"); }
 
   // ═══ REGIME DETECTION ═══
+  // V5.0 FIX C2: regime stored FLAT at apex:regime, not nested under `current`.
   const regime = await kvGet("apex:regime");
-  if (regime?.current) {
-    pass("REGIME:current", `${regime.current.primary_code} (${regime.current.confidence}% conf)`);
-    if (regime.current.detected_at) {
-      const hrs = Math.floor((Date.now() - new Date(regime.current.detected_at).getTime()) / 3600000);
+  if (regime?.primary_code) {
+    pass("REGIME:current", `${regime.primary_code} (${regime.confidence || "?"}% conf)`);
+    if (regime.timestamp) {
+      const hrs = Math.floor((Date.now() - new Date(regime.timestamp).getTime()) / 3600000);
       hrs > 6 ? warn("REGIME:last_detection", `${hrs}h ago`) : pass("REGIME:last_detection", `${hrs}h ago`);
     }
   } else { warn("REGIME:current", "Not detected yet"); }
 
   // ═══ PEACE SIGNAL ═══
-  const peaceSignal = kvState?.signals;
+  // V5.0 FIX C5: peace signal now lives at apex:peace_signal (written by altdata route).
+  // Old code read kvState.signals which is only populated manually via update_signals.
+  const peaceSignal = await kvGet("apex:peace_signal");
   if (peaceSignal) {
-    const score = peaceSignal.total || 0;
-    score >= 3 ? warn("PEACE:score", `${score}/6 — EXIT THRESHOLD`) : pass("PEACE:score", `${score}/6`);
+    const score = peaceSignal.score || 0;
+    const ageHrs = peaceSignal.timestamp ? Math.floor((Date.now() - new Date(peaceSignal.timestamp).getTime()) / 3600000) : null;
+    if (score >= 3) warn("PEACE:score", `${score}/8 — EXIT ARMED`);
+    else pass("PEACE:score", `${score}/8`);
+    if (ageHrs != null) {
+      ageHrs > 8 ? warn("PEACE:freshness", `${ageHrs}h old`) : pass("PEACE:freshness", `${ageHrs}h ago`);
+    }
+  } else {
+    warn("PEACE:state", "altdata cron has not populated peace signal yet");
   }
 
   // ═══ ADAPTIVE LEARNING ═══
-  const learning = await kvGet("apex:adaptive_learning");
+  // V5.0 FIX C5: correct key is apex:learning (not apex:adaptive_learning).
+  const learning = await kvGet("apex:learning");
   if (learning) {
-    pass("LEARNING:samples", `${learning.total_samples || 0} trades analyzed`);
-    pass("LEARNING:brier", `${(learning.brier_score || 0).toFixed(3)}`);
-  } else { warn("LEARNING:state", "No data yet"); }
-
-  // ═══ ALT DATA ═══
-  const altData = await kvGet("apex:altdata");
-  if (altData) {
-    const ageHrs = altData.timestamp ? Math.floor((Date.now() - new Date(altData.timestamp).getTime()) / 3600000) : null;
-    pass("ALTDATA:composite", `Peace: ${altData.composite?.score}/8`);
-    ageHrs != null && (ageHrs > 4 ? warn("ALTDATA:freshness", `${ageHrs}h old`) : pass("ALTDATA:freshness", `${ageHrs}h ago`));
-  } else { warn("ALTDATA:state", "Not updated yet"); }
+    const samples = learning.sample_size || 0;
+    samples >= 10 ? pass("LEARNING:samples", `${samples} trades analysed`) : warn("LEARNING:samples", `${samples} trades (need 10+ for signal)`);
+    if (learning.brier_score != null) {
+      const brier = learning.brier_score;
+      brier < 0.2 ? pass("LEARNING:brier", `${brier.toFixed(3)} (well-calibrated)`)
+        : brier < 0.25 ? pass("LEARNING:brier", `${brier.toFixed(3)} (decent)`)
+        : warn("LEARNING:brier", `${brier.toFixed(3)} (uncalibrated)`);
+    }
+    if (learning.accuracy != null) pass("LEARNING:accuracy", `${learning.accuracy}% win rate`);
+  } else { warn("LEARNING:state", "No data yet — close trades to populate"); }
 
   // ═══ STRATEGY ENGINE ═══
   const strategy = await kvGet("apex:strategy_recommendations");
@@ -124,13 +137,12 @@ export async function GET(req) {
   const red = checks.filter(c => c.status === "RED").length;
 
   const readable = [
-    `APEX BRAIN V4.6 HEALTH CHECK`,
+    `APEX BRAIN V5.0 HEALTH CHECK`,
     `${green}/${checks.length} GREEN | ${amber} AMBER | ${red} RED`,
     `Overall: ${red > 0 ? "DEGRADED" : amber > 0 ? "HEALTHY (warnings)" : "ALL GREEN"}`,
     "", ...checks.map(c => `${c.status === "GREEN" ? "✅" : c.status === "AMBER" ? "🟡" : "🔴"} ${c.name}: ${c.detail}`)
   ].join("\n");
 
-  // Structured categories for UI grouping
   const grouped = {};
   for (const c of checks) {
     const cat = c.name.split(":")[0];
@@ -154,10 +166,14 @@ export async function GET(req) {
       rejected_confidence: lastScan.rejected_confidence,
       blocked_earnings: lastScan.blocked_earnings,
       fetch_errors: lastScan.fetch_errors,
+      suspect_data: lastScan.suspect_data_tickers,
       dismissed_count: lastScan.dismissed_count,
       healing_applied: lastScan.healing_applied,
+      ai_judgments: lastScan.ai_judgments,
+      ai_vetoes: lastScan.ai_vetoes,
     } : null,
-    regime_current: regime?.current || null,
+    regime_current: regime || null,
+    peace_signal: peaceSignal || null,
     timestamp: new Date().toISOString(),
   });
 }
