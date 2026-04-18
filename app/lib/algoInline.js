@@ -1,7 +1,13 @@
-// APEX BRAIN V2 — ALGO INLINE (Tiers 1-3)
+// APEX BRAIN V5.0 — ALGO INLINE (Tiers 1-3)
 // Runs inline with chat route. Provides real-time risk screens + signals.
+//
+// V5.0 FIX (S2): Import canonical SECTOR_MAP from scannerAdvanced.js instead of
+// hardcoded 25-ticker subset. Previous version's correlation audit was wrong for
+// anything outside the subset (e.g. FCX, OXY, EOG, SLV, GDX, VNQ, XLU correctly
+// had sectors but algoInline returned "Other" for them).
 
 import { ALGO_THRESHOLDS } from "../data/algoConfig.js";
+import { SECTOR_MAP as CANONICAL_SECTOR_MAP, THEME_MAP } from "./scannerAdvanced.js";
 
 // ═══ SAFE MATH ═══
 function $(v, d = 2) { const n = Number(v); return isFinite(n) ? n.toFixed(d) : "—"; }
@@ -71,10 +77,8 @@ function runScreens(positions, prices, account) {
       if (rr !== null && rr < T.min_rr) {
         if (profitable) {
           // GOOD deterioration — price moved toward T1, compressing R:R naturally
-          // This is the trade WORKING, not a problem. Info only.
           screens.push({ ticker: pos.id, screen: "RR_COMPRESSED_GOOD", level: "GREEN", detail: `R:R ${$(rr, 1)}:1 — trade working, approaching T1. Rule 8: let it run.`, value: rr });
         } else {
-          // BAD deterioration — price moved toward stop, T1 getting further away
           if (rr < 1.5) {
             screens.push({ ticker: pos.id, screen: "RR_DETERIORATED", level: "RED", detail: `R:R now ${$(rr, 1)}:1 — losing AND poor R:R. Review exit.`, value: rr });
           } else {
@@ -112,6 +116,33 @@ function runScreens(positions, prices, account) {
   return screens;
 }
 
+// ═══ SECTOR LOOKUP — canonical + aliases ═══
+// Scanner sectors vs strategy engine use different naming conventions.
+// Map both namespaces so theme exposure reports are consistent regardless of input.
+const SECTOR_ALIASES = {
+  // strategy-engine-style → scanner-style
+  banks: "Banks", semis: "Semis", mega_tech: "Tech", copper: "Copper",
+  gold: "Gold", miners: "Mining", defence: "Defence", airlines: "Airlines",
+  long_bonds: "LongBonds", short_bonds: "ShortBonds", utility_etf: "Utilities",
+  energy: "Energy", refiner: "Energy", lng: "LNG", natgas: "NatGas",
+  international: "Intl",
+};
+
+function getSector(ticker) {
+  const t = (ticker || "").toUpperCase();
+  // Prefer canonical scanner map (117 tickers, maintained source of truth)
+  const canonical = CANONICAL_SECTOR_MAP[t];
+  if (canonical) return canonical;
+  return "Other";
+}
+
+// Normalise sector names from any source into canonical scanner labels
+export function normaliseSector(s) {
+  if (!s) return "Other";
+  if (CANONICAL_SECTOR_MAP[s]) return CANONICAL_SECTOR_MAP[s]; // Already a ticker? shouldn't happen here
+  return SECTOR_ALIASES[s] || s;
+}
+
 // ═══ TIER 2: CORRELATION AUDIT ═══
 function runCorrelation(positions, account) {
   const nav = Number(account?.nav) || 1;
@@ -121,7 +152,6 @@ function runCorrelation(positions, account) {
     const sector = getSector(pos.id);
     if (!themes[sector]) themes[sector] = { positions: [], exposure: 0 };
     themes[sector].positions.push(pos.id);
-    // Approximate exposure in GBP
     const val = Number(pos.entry_price) * Number(pos.units);
     const gbp = pos.currency === "GBP" ? val : val / (Number(account?.gbp_usd) || 1.34);
     themes[sector].exposure += gbp;
@@ -150,20 +180,6 @@ function runCorrelation(positions, account) {
   return { themes: Object.fromEntries(Object.entries(themes).map(([k, v]) => [k, { ...v, pct: parseFloat($(v.exposure / nav * 100, 1)) }])), violations };
 }
 
-function getSector(ticker) {
-  const map = {
-    JPM: "Financial", BAC: "Financial", MS: "Financial", GS: "Financial",
-    FCX: "Materials", COPX: "Materials",
-    NVDA: "Technology", MSFT: "Technology", SMCI: "Technology", AVGO: "Technology",
-    MPC: "Energy", CVX: "Energy", XOM: "Energy", SLB: "Energy", HAL: "Energy",
-    LMT: "Defence", RTX: "Defence", GD: "Defence",
-    DAL: "Airlines", UAL: "Airlines", IAG: "Airlines",
-    GLNG: "LNG", LNG: "LNG", APD: "Industrial Gas", EQT: "Natural Gas",
-    EWJ: "International", TLT: "Bonds", GDX: "Metals", XLU: "Utilities", VNQ: "REITs",
-  };
-  return map[ticker?.toUpperCase()] || "Other";
-}
-
 // ═══ TIER 3: PORTFOLIO RISK ═══
 function runPortfolioRisk(positions, prices, account) {
   const nav = Number(account?.nav) || 1;
@@ -177,12 +193,10 @@ function runPortfolioRisk(positions, prices, account) {
     const units = Number(pos.units);
     const dir = (pos.direction || "buy").toLowerCase();
 
-    // Exposure
     const expUsd = (lp || entry) * units;
     const expGbp = pos.currency === "GBP" ? expUsd : expUsd / gbp;
     totalExposure += expGbp;
 
-    // Risk (distance to stop)
     if (pos.stop && lp) {
       const riskUsd = Math.abs(lp - pos.stop) * units;
       const riskGbp = pos.currency === "GBP" ? riskUsd : riskUsd / gbp;
@@ -190,7 +204,6 @@ function runPortfolioRisk(positions, prices, account) {
       positionRisks.push({ ticker: pos.id, risk_gbp: parseFloat($(riskGbp)), risk_pct: parseFloat($((riskGbp / nav) * 100, 1)) });
     }
 
-    // Open P&L
     if (lp) {
       const pl = plPerUnit(entry, lp, dir) * units;
       totalOpenPL += pos.currency === "GBP" ? pl : pl / gbp;
@@ -212,7 +225,6 @@ function runPortfolioRisk(positions, prices, account) {
 function formatDashboard(screens, correlation, risk) {
   const lines = ["=== ALGO ENGINE OUTPUT ==="];
 
-  // Screens
   const reds = screens.filter(s => s.level === "RED");
   const ambers = screens.filter(s => s.level === "AMBER");
   const greens = screens.filter(s => s.level === "GREEN");
@@ -230,7 +242,6 @@ function formatDashboard(screens, correlation, risk) {
     for (const s of greens) lines.push(`  ${s.ticker}: ${s.screen} — ${s.detail}`);
   }
 
-  // Correlation
   if (correlation.violations.length) {
     lines.push(`\n⚠️ CORRELATION:`);
     for (const v of correlation.violations) lines.push(`  ${v.detail}`);
@@ -240,7 +251,6 @@ function formatDashboard(screens, correlation, risk) {
     lines.push(`  ${theme}: ${data.pct}% NAV (${data.positions.join(", ")})`);
   }
 
-  // Risk
   lines.push(`\nPORTFOLIO RISK:`);
   lines.push(`  Exposure: £${risk.total_exposure_gbp} (${risk.exposure_pct}% NAV)`);
   lines.push(`  Max drawdown: £${risk.total_risk_gbp} (${risk.max_drawdown_pct}% NAV)`);
