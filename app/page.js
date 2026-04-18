@@ -193,7 +193,7 @@ export default function ApexBrain(){
           </div>)}
           <div ref={chatScroller} style={{flex:1,overflowY:"auto",padding:"8px 12px"}}>
             {messages.length===0&&(<div style={{textAlign:"center",marginTop:40,color:T.textDim}}>
-              <div style={{fontSize:36,marginBottom:6}}>🧠</div><div style={{fontSize:13,fontWeight:600}}>APEX BRAIN V5.0</div>
+              <div style={{fontSize:36,marginBottom:6}}>🧠</div><div style={{fontSize:13,fontWeight:600}}>APEX BRAIN V5.1</div>
               <div style={{fontSize:10,marginTop:4}}>Chat commands: "move JPM stop to 300" • "close BAC at 54" • "BAC T1 to 57"</div>
               <div style={{display:"flex",flexWrap:"wrap",gap:4,justifyContent:"center",marginTop:12}}>
                 {["Morning brief","How are my positions?","Weekly review","BAC earnings prep","What's the regime?","Scan for opportunities"].map((q,i)=>(<button key={i} onClick={()=>sendMessage(q)} style={{padding:"5px 10px",background:T.card,border:`1px solid ${T.border}`,borderRadius:14,color:T.textDim,fontSize:10,cursor:"pointer"}}>{q}</button>))}
@@ -222,13 +222,26 @@ export default function ApexBrain(){
             <span style={{fontSize:14,fontWeight:700,color:T.text}}>{positions.length}/10 Positions</span>
             <button onClick={()=>setShowAdd(true)} style={{padding:"5px 12px",background:T.gold,color:"#000",fontWeight:700,border:"none",borderRadius:6,fontSize:11,cursor:"pointer"}}><Plus size={12}/> Add</button>
           </div>
-          {positionsWithPL.map((pos,i)=>{const up=pos.plGbp>=0;const dir=(pos.direction||"buy").toUpperCase();return(
-            <div key={i} style={{padding:"8px 10px",background:T.card,borderRadius:8,marginBottom:6,border:`1px solid ${pos.stopDist!=null&&pos.stopDist<5?T.red:T.border}`}}>
-              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-                <div><span style={{fontSize:14,fontWeight:700,color:T.text}}>{pos.id}</span><span style={{fontSize:9,color:T.textDim,marginLeft:6}}>[{pos.sleeve}/{dir}]</span></div>
+          {positionsWithPL.map((pos,i)=>{const up=pos.plGbp>=0;const dir=(pos.direction||"buy").toUpperCase();
+            // V5.1: Trailing stop state
+            const hasTrailing=pos.trailing_stop!=null&&pos.trailing_stop_pct!=null;
+            const effectiveStop=hasTrailing?pos.trailing_stop:pos.stop;
+            const trailBreached=hasTrailing&&pos.livePrice!=null&&(
+              (pos.direction==="buy"||pos.direction==="long"||!pos.direction)?pos.livePrice<=pos.trailing_stop:pos.livePrice>=pos.trailing_stop
+            );
+            const cardBorder=trailBreached?T.red:(pos.stopDist!=null&&pos.stopDist<5&&!hasTrailing)?T.red:hasTrailing?T.green:T.border;
+            return(
+            <div key={i} style={{padding:"8px 10px",background:T.card,borderRadius:8,marginBottom:6,border:`1px solid ${cardBorder}`}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:4}}>
+                <div style={{display:"flex",alignItems:"center",gap:4,flexWrap:"wrap"}}>
+                  <span style={{fontSize:14,fontWeight:700,color:T.text}}>{pos.id}</span>
+                  <span style={{fontSize:9,color:T.textDim}}>[{pos.sleeve}/{dir}]</span>
+                  {hasTrailing&&!trailBreached&&<span style={{padding:"1px 5px",background:T.green+"20",color:T.green,borderRadius:3,fontSize:8,fontWeight:700,letterSpacing:0.5}} title={`Trailing ${pos.trailing_stop_pct}% below HWM $${fmt(pos.trailing_stop_hwm)}`}>🔒 TRAIL {pos.trailing_stop_pct}%</span>}
+                  {trailBreached&&<span style={{padding:"1px 5px",background:T.red+"20",color:T.red,borderRadius:3,fontSize:8,fontWeight:700,letterSpacing:0.5}}>🚨 BREACHED</span>}
+                </div>
                 <div style={{display:"flex",gap:4}}>
                   <button onClick={()=>setClosePos({ticker:pos.id,units:pos.units,max_units:pos.units,entry_price:pos.entry_price,current_price:pos.livePrice,direction:pos.direction,sleeve:pos.sleeve,currency:pos.currency,exit_price:pos.livePrice||pos.entry_price})} title="Close position" style={{...btnS,width:24,height:24,background:T.red+"20"}}><X size={10} color={T.red}/></button>
-                  <button onClick={()=>setEditPos({ticker:pos.id,stop:pos.stop||"",t1:pos.t1||"",t2:pos.t2||"",units:pos.units,sleeve:pos.sleeve,direction:pos.direction||"buy",thesis:pos.thesis||"",conviction:pos.conviction||3})} style={{...btnS,width:24,height:24}}><Edit3 size={10} color={T.textDim}/></button>
+                  <button onClick={()=>setEditPos({ticker:pos.id,stop:pos.stop||"",t1:pos.t1||"",t2:pos.t2||"",units:pos.units,sleeve:pos.sleeve,direction:pos.direction||"buy",thesis:pos.thesis||"",conviction:pos.conviction||3,trailing_stop_pct:pos.trailing_stop_pct||"",trailing_stop:pos.trailing_stop||"",trailing_stop_hwm:pos.trailing_stop_hwm||""})} style={{...btnS,width:24,height:24}}><Edit3 size={10} color={T.textDim}/></button>
                 </div>
               </div>
               <div style={{display:"flex",justifyContent:"space-between",marginTop:3,fontSize:12,fontFamily:T.mono}}>
@@ -236,7 +249,7 @@ export default function ApexBrain(){
                 <span style={{color:up?T.green:T.red,fontWeight:700}}>{up?"+":""}£{fmt(pos.plGbp)} ({up?"+":""}{fmt(pos.plPct,1)}%)</span>
               </div>
               <div style={{display:"flex",justifyContent:"space-between",marginTop:2,fontSize:10,color:T.textDim}}>
-                <span>Stop: ${pos.stop||"—"} ({pos.stopDist!=null?fmt(pos.stopDist,1)+"% away":"no stop"})</span>
+                <span>{hasTrailing?<><span style={{color:T.green}}>🔒 Trail: ${fmt(pos.trailing_stop)}</span> (HWM ${fmt(pos.trailing_stop_hwm)})</>:<>Stop: ${pos.stop||"—"} ({pos.stopDist!=null?fmt(pos.stopDist,1)+"% away":"no stop"})</>}</span>
                 <span>T1: ${pos.t1||"—"} {pos.t1Dist!=null&&pos.t1Dist<5?"🟢":""}</span>
               </div>
               {pos.thesis&&<div style={{fontSize:10,color:T.textDim,marginTop:3,fontStyle:"italic"}}>{pos.thesis}</div>}
@@ -795,6 +808,21 @@ export default function ApexBrain(){
           <Sel v={editPos.sleeve} c={v=>setEditPos(p=>({...p,sleeve:v}))} opts={[["A","Sleeve A"],["B","Sleeve B"],["C","Sleeve C"],["Independent","Independent"]]}/>
           <Sel v={editPos.direction} c={v=>setEditPos(p=>({...p,direction:v}))} opts={[["buy","LONG"],["short","SHORT"]]}/>
           <Inp p="Conviction (1-4)" v={editPos.conviction} c={v=>setEditPos(p=>({...p,conviction:v}))} t="number"/>
+        </div>
+        {/* V5.1: Trailing stop controls */}
+        <div style={{marginTop:10,padding:"8px 10px",background:T.card,borderRadius:8,border:`1px solid ${editPos.trailing_stop_pct?T.green:T.border}`}}>
+          <div style={{fontSize:10,color:editPos.trailing_stop_pct?T.green:T.textDim,fontWeight:700,letterSpacing:1,marginBottom:6}}>
+            🔒 TRAILING STOP {editPos.trailing_stop_pct?"(ACTIVE)":"(inactive — set % to enable)"}
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6}}>
+            <Inp p="Trail %" v={editPos.trailing_stop_pct} c={v=>setEditPos(p=>({...p,trailing_stop_pct:v}))} t="number"/>
+            <Inp p="Trail Stop $ (auto)" v={editPos.trailing_stop} c={v=>setEditPos(p=>({...p,trailing_stop:v}))} t="number"/>
+          </div>
+          <div style={{fontSize:9,color:T.textDim,marginTop:4,lineHeight:1.4}}>
+            Set Trail % (e.g. 5 = 5% below high-water-mark). Stop auto-advances on price rises, never drops.
+            {editPos.trailing_stop_hwm?` Current HWM: $${editPos.trailing_stop_hwm}`:" HWM will be set from first price tick."}
+          </div>
+          {editPos.trailing_stop_pct&&<button onClick={()=>setEditPos(p=>({...p,trailing_stop_pct:"",trailing_stop:"",trailing_stop_hwm:""}))} style={{marginTop:6,padding:"4px 8px",background:T.cardHover,border:`1px solid ${T.red}`,borderRadius:4,color:T.red,fontSize:10,cursor:"pointer"}}>Disable Trailing</button>}
         </div>
         <Inp p="Thesis" v={editPos.thesis} c={v=>setEditPos(p=>({...p,thesis:v}))} full/>
         <Btn onClick={saveEdit}>Save Changes</Btn>
