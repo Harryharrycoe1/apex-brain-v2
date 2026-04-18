@@ -18,6 +18,12 @@ async function kvSet(key, value) {
 }
 
 // ═══ YAHOO FINANCE (PRIMARY) — includes pre/post market ═══
+// V5.0 FIX C1: derive prevClose from the last 2 bars in the closes array,
+// NOT meta.chartPreviousClose (which returns ~1 year ago on range=1y).
+// On range=5d specifically, chartPreviousClose is the first close in the range — still not yesterday.
+// V5.0 FIX S3: no longer unconditionally prefer postMarket/preMarket over regular price.
+// Only use extended-hours price when sane (within 10% of last regular close).
+// A stale/thin bid at 3% of last close would corrupt changePct for all consumers.
 async function fetchYahoo(symbol) {
   try {
     const r = await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=5d&includePrePost=true`, {
@@ -25,28 +31,39 @@ async function fetchYahoo(symbol) {
     });
     if (!r.ok) return null;
     const data = await r.json();
-    const meta = data?.chart?.result?.[0]?.meta;
+    const result = data?.chart?.result?.[0];
+    const meta = result?.meta;
     if (!meta) return null;
 
     const isPence = PENCE_SYMBOLS.includes(symbol);
-    let price = Number(meta.regularMarketPrice);
-    let prev = Number(meta.chartPreviousClose || meta.previousClose) || price;
-    let preMarket = meta.preMarketPrice ? Number(meta.preMarketPrice) : null;
-    let postMarket = meta.postMarketPrice ? Number(meta.postMarketPrice) : null;
+    const adj = isPence ? 100 : 1;
+    let price = Number(meta.regularMarketPrice) / adj;
+    let preMarket = meta.preMarketPrice ? Number(meta.preMarketPrice) / adj : null;
+    let postMarket = meta.postMarketPrice ? Number(meta.postMarketPrice) / adj : null;
 
-    if (isPence) {
-      price /= 100; prev /= 100;
-      if (preMarket) preMarket /= 100;
-      if (postMarket) postMarket /= 100;
-    }
     if (!isFinite(price)) return null;
 
-    // Use the most recent available price
-    const effectivePrice = postMarket || preMarket || price;
-    const changePct = prev ? ((effectivePrice - prev) / prev * 100) : 0;
+    // V5.0 FIX C1: compute prev from bar history, not meta.
+    const closes = (result?.indicators?.quote?.[0]?.close?.filter(c => c != null) || []).map(c => c / adj);
+    let prev;
+    if (closes.length >= 2) {
+      prev = closes[closes.length - 2];
+    } else if (closes.length === 1) {
+      // Only today's bar — use meta.previousClose (single-day endpoint's true previous)
+      prev = Number(meta.previousClose) / adj || price;
+    } else {
+      prev = Number(meta.previousClose) / adj || price;
+    }
 
-    // 5d closes for momentum
-    const closes = data?.chart?.result?.[0]?.indicators?.quote?.[0]?.close?.filter(c => c != null) || [];
+    // V5.0 FIX S3: validate extended-hours prices before using them.
+    // A stale/erroneous pre/post market quote can be far from the actual price.
+    // Only substitute if within 10% of regular price (typical max overnight move).
+    const isSane = (p) => p && isFinite(p) && Math.abs((p - price) / price) < 0.10;
+    const effectivePrice = (marketState(meta) === "POST" && isSane(postMarket)) ? postMarket
+                        : (marketState(meta) === "PRE" && isSane(preMarket)) ? preMarket
+                        : price;
+
+    const changePct = prev > 0 ? ((effectivePrice - prev) / prev * 100) : 0;
 
     return {
       price: Math.round(effectivePrice * 10000) / 10000,
@@ -58,11 +75,19 @@ async function fetchYahoo(symbol) {
       currency: isPence ? "GBP" : (meta.currency || "USD"),
       marketState: meta.marketState || "UNKNOWN",
       source: "yahoo",
-      closes5d: isPence ? closes.map(c => c / 100) : closes,
+      closes5d: closes,
     };
   } catch (e) {
     return null;
   }
+}
+
+// Helper: market state from meta
+function marketState(meta) {
+  const s = (meta?.marketState || "").toUpperCase();
+  if (s.startsWith("PRE")) return "PRE";
+  if (s.startsWith("POST")) return "POST";
+  return "REGULAR";
 }
 
 // ═══ FINNHUB BACKUP (free tier: 60 calls/min) ═══
@@ -87,11 +112,9 @@ async function fetchFinnhub(symbol) {
 
 // ═══ FETCH WITH FALLBACK ═══
 async function fetchPrice(key, yahooSymbol) {
-  // Try Yahoo first
   let result = await fetchYahoo(yahooSymbol);
   if (result) return result;
 
-  // Fallback to Finnhub (US stocks only, different symbol format)
   if (!yahooSymbol.includes("=") && !yahooSymbol.startsWith("^") && !yahooSymbol.includes(".")) {
     result = await fetchFinnhub(yahooSymbol);
     if (result) return result;
@@ -146,7 +169,6 @@ export async function GET(req) {
     const now = new Date();
     const elapsed = Date.now() - startTime;
 
-    // Log errors for health monitoring
     if (errors.length > 0) {
       const errorLog = await kvGet("apex:price_errors") || [];
       errorLog.push({ timestamp: now.toISOString(), errors, elapsed_ms: elapsed });
