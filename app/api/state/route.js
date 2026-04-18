@@ -1,3 +1,8 @@
+// APEX BRAIN V5.1 — STATE ROUTE
+// V5.0: C3 adaptive learning wiring, costModel on close
+// V5.1: trailing_stop_pct and trailing_stop_hwm fields in update_position,
+//       disabling trailing clears all related fields.
+
 import { NextResponse } from "next/server";
 import { DEFAULT_STATE } from "../../data/fundState.js";
 import { WATCHLIST } from "../../data/algoConfig.js";
@@ -202,7 +207,37 @@ export async function POST(req) {
           changes.push(`Stop: $${pos.stop} → $${newStop}`);
           pos.stop = newStop;
         }
-        if (body.trailing_stop !== undefined) { changes.push(`Trailing: $${pos.trailing_stop} → $${body.trailing_stop}`); pos.trailing_stop = Number(body.trailing_stop); }
+        if (body.trailing_stop !== undefined) {
+          const newTS = body.trailing_stop === "" || body.trailing_stop === null ? null : Number(body.trailing_stop);
+          changes.push(`Trailing: $${pos.trailing_stop || "—"} → $${newTS || "—"}`);
+          pos.trailing_stop = newTS;
+        }
+        // V5.1: trailing stop configuration
+        if (body.trailing_stop_pct !== undefined) {
+          const newPct = body.trailing_stop_pct === "" || body.trailing_stop_pct === null ? null : Number(body.trailing_stop_pct);
+          if (newPct === null) {
+            // Disabling trailing — clear all trailing fields
+            changes.push(`🔓 Trailing DISABLED (was ${pos.trailing_stop_pct}%)`);
+            pos.trailing_stop_pct = null;
+            pos.trailing_stop = null;
+            pos.trailing_stop_hwm = null;
+            pos.trailing_stop_activated = null;
+            pos.trailing_stop_last_update = null;
+          } else {
+            changes.push(`🔒 Trailing: ${pos.trailing_stop_pct || "off"}% → ${newPct}%`);
+            pos.trailing_stop_pct = newPct;
+            // If enabling for first time, clear HWM so worker initializes on next tick
+            if (!pos.trailing_stop_activated) {
+              pos.trailing_stop_hwm = null;
+              pos.trailing_stop_activated = new Date().toISOString();
+            }
+          }
+        }
+        if (body.trailing_stop_hwm !== undefined) {
+          const newHwm = body.trailing_stop_hwm === "" || body.trailing_stop_hwm === null ? null : Number(body.trailing_stop_hwm);
+          if (newHwm !== pos.trailing_stop_hwm) changes.push(`HWM manually set: $${pos.trailing_stop_hwm || "—"} → $${newHwm || "—"}`);
+          pos.trailing_stop_hwm = newHwm;
+        }
         if (body.t1 !== undefined) { changes.push(`T1: $${pos.t1} → $${body.t1}`); pos.t1 = Number(body.t1); }
         if (body.t2 !== undefined) { changes.push(`T2: $${pos.t2} → $${body.t2}`); pos.t2 = Number(body.t2); }
         if (body.units !== undefined) { changes.push(`Units: ${pos.units} → ${body.units}`); pos.units = Number(body.units); }
