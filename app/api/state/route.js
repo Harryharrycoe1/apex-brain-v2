@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server";
 import { DEFAULT_STATE } from "../../data/fundState.js";
 import { WATCHLIST } from "../../data/algoConfig.js";
+import { initLearningState, recordOutcome } from "../../lib/adaptiveLearning.js";
+import { calculateTradeCosts } from "../../lib/costModel.js";
 
 export const maxDuration = 30;
 
@@ -31,12 +33,87 @@ function calcPL(entry, exit, units, direction) {
   return (dir === "short" || dir === "sell") ? (entry - exit) * units : (exit - entry) * units;
 }
 
+// ═══ V5.0 ADAPTIVE LEARNING HOOK (FIX C3) ═══
+// Called on every close — feeds actual trade outcome back into signal weights.
+// Matches against setup_tracker for signals_at_entry, falls back gracefully if not found.
+async function feedLearningFromClose(ticker, entryPrice, exitPrice, units, direction) {
+  try {
+    const tracker = await kvGet("apex:setup_tracker") || { suggestions: [] };
+
+    // Find the most recent suggestion for this ticker where outcome is still null
+    // and entry is within 3% of actual fill (tolerance for slippage/manual entry).
+    let match = null;
+    for (let i = tracker.suggestions.length - 1; i >= 0; i--) {
+      const s = tracker.suggestions[i];
+      if (s.ticker === ticker && !s.outcome && s.entry && Math.abs((s.entry - entryPrice) / s.entry) < 0.03) {
+        match = s;
+        break;
+      }
+    }
+
+    if (!match?.signals_at_entry) {
+      // No matching setup with signals — skip learning rather than feed synthetic data.
+      // This is better than polluting the learning state with fake weights.
+      console.log(`[LEARN] ${ticker} closed but no matching setup_tracker entry with signals. Skipping adaptive update.`);
+      return { skipped: true, reason: "No setup_tracker match" };
+    }
+
+    // Load current learning state
+    let learningState = await kvGet("apex:learning") || initLearningState();
+
+    // Record outcome with REAL signals (not synthetic defaults)
+    const trade = {
+      id: ticker,
+      entry_price: entryPrice,
+      exit_price: exitPrice,
+      direction,
+    };
+    learningState = recordOutcome(learningState, trade, match.signals_at_entry);
+    await kvSet("apex:learning", learningState);
+
+    console.log(`[LEARN] ${ticker} outcome recorded. Brier: ${learningState.brier_score}, samples: ${learningState.sample_size}`);
+    return {
+      fed: true,
+      brier_score: learningState.brier_score,
+      sample_size: learningState.sample_size,
+      matched_entry: match.entry,
+    };
+  } catch (e) {
+    console.error("[LEARN] Feed failed:", e.message);
+    return { error: e.message };
+  }
+}
+
+// ═══ MARK SETUP_TRACKER OUTCOME (unchanged, split into helper) ═══
+async function markSetupOutcome(ticker, entryPrice, exitPrice, direction, exitDate, reason) {
+  try {
+    const tracker = await kvGet("apex:setup_tracker") || { suggestions: [] };
+    let updated = false;
+    for (let i = tracker.suggestions.length - 1; i >= 0; i--) {
+      const s = tracker.suggestions[i];
+      if (s.ticker === ticker && !s.outcome && s.entry && Math.abs((s.entry - entryPrice) / s.entry) < 0.03) {
+        s.outcome = {
+          exit_price: exitPrice,
+          pl_pct: ((exitPrice - entryPrice) / entryPrice) * 100 * (direction === "short" ? -1 : 1),
+          hit_t1: direction === "buy" ? exitPrice >= s.t1 : exitPrice <= s.t1,
+          hit_stop: direction === "buy" ? exitPrice <= s.stop : exitPrice >= s.stop,
+          exit_date: exitDate,
+          reason: reason || "Manual close",
+        };
+        updated = true;
+        break;
+      }
+    }
+    if (updated) await kvSet("apex:setup_tracker", tracker);
+    return updated;
+  } catch { return false; }
+}
+
 export async function GET(req) {
   const auth = req.headers.get("x-apex-key");
   if (auth !== process.env.APEX_ACCESS_KEY) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   let state = await kvGet("apex:state");
   if (state) {
-    // ═══ V4.8 MIGRATION: wipe legacy manual pipeline (now APEX scanner + active pipeline) ═══
     let changed = false;
     if (!state.v48_migrated) {
       state.pipeline = [];
@@ -95,19 +172,19 @@ export async function POST(req) {
           t1: body.t1 != null ? Number(body.t1) : null, t2: body.t2 != null ? Number(body.t2) : null,
           kill_switch: body.kill_switch || "", peace_action: body.peace_action || "",
           thesis: body.thesis || "", conviction: Number(body.conviction) || 3, notes: body.notes || "",
+          // V5.0: if opening from promote_to_active, preserve signals_at_entry for learning
+          signals_at_entry: body.signals_at_entry || null,
         };
         if (!state.positions) state.positions = [];
         state.positions.push(pos);
         state.account.last_updated = new Date().toISOString();
 
-        // Log strategy event
         await logStrategy(state, `OPENED ${v.ticker} ${pos.direction.toUpperCase()} ${pos.units}u @ $${pos.entry_price} [${pos.sleeve}] — ${pos.thesis || "no thesis"}`);
 
         const ok = await kvSet("apex:state", state);
         return NextResponse.json({ ok, action: "add_position", position: pos, warning: v.unknown ? `${v.ticker} not in watchlist` : undefined });
       }
 
-      // ═══ UPDATE ANY FIELD ON AN EXISTING POSITION ═══
       case "update_position": {
         const ticker = (body.ticker || body.id || "").toUpperCase();
         const idx = (state.positions || []).findIndex(p => p.id === ticker);
@@ -116,7 +193,6 @@ export async function POST(req) {
         const pos = state.positions[idx];
         const changes = [];
 
-        // Update any field that's provided
         if (body.stop !== undefined) {
           const newStop = Number(body.stop);
           const dir = (pos.direction || "buy").toLowerCase();
@@ -157,14 +233,48 @@ export async function POST(req) {
         const exitPrice = Number(body.exit_price) || Number(pos.entry_price);
         const rawPL = calcPL(pos.entry_price, exitPrice, pos.units, pos.direction);
         const gbpUsd = Number(state.account?.gbp_usd) || 1.34;
-        const plGbp = pos.currency === "GBP" ? rawPL : rawPL / gbpUsd;
+        const plGbpGross = pos.currency === "GBP" ? rawPL : rawPL / gbpUsd;
+
+        // V5.0: Wire costModel — compute real net P&L after spread, financing, FX
+        let plGbp = plGbpGross;
+        let costBreakdown = null;
+        try {
+          const daysHeld = pos.entry_date
+            ? Math.max(0, Math.ceil((Date.now() - new Date(pos.entry_date).getTime()) / 86400000))
+            : 0;
+          const tc = calculateTradeCosts(
+            ticker, pos.entry_price, exitPrice, pos.units,
+            pos.direction || "buy", daysHeld, pos.currency || "USD"
+          );
+          if (tc && Number.isFinite(tc.net_pl_gbp)) {
+            plGbp = Math.round(tc.net_pl_gbp * 100) / 100;
+            costBreakdown = {
+              gross_pl_gbp: Math.round(plGbpGross * 100) / 100,
+              net_pl_gbp: plGbp,
+              total_cost_gbp: Math.round((plGbpGross - plGbp) * 100) / 100,
+              days_held: daysHeld,
+              spread_cost_usd: tc.spread_cost?.total_spread_cost,
+              financing_cost_usd: tc.financing_cost?.total,
+              slippage_cost_usd: tc.slippage_cost?.total,
+              fx_cost_gbp: tc.fx_cost?.fx_charge_gbp,
+            };
+          }
+        } catch (e) {
+          // If costModel fails for any reason, fall back to gross (but log)
+          console.error("costModel error for " + ticker + ":", e.message);
+        }
 
         const closed = {
           id: `${ticker}-${Date.now()}`, ticker, name: pos.name, direction: pos.direction || "buy",
           entry_price: pos.entry_price, exit_price: exitPrice, units: pos.units,
           sleeve: pos.sleeve, entry_date: pos.entry_date, exit_date: new Date().toISOString(),
-          net_pl: Math.round(plGbp * 100) / 100, reason: body.reason || "Manual close",
+          net_pl: Math.round(plGbp * 100) / 100,
+          gross_pl: Math.round(plGbpGross * 100) / 100,
+          costs: costBreakdown,
+          reason: body.reason || "Manual close",
           exit_type: body.exit_type || "manual", thesis: pos.thesis,
+          // V5.0: preserve signals for future audits
+          signals_at_entry: pos.signals_at_entry || null,
         };
         if (!state.closed) state.closed = [];
         state.closed.push(closed);
@@ -172,34 +282,17 @@ export async function POST(req) {
         state.account.total_realised_pl = Math.round(((state.account.total_realised_pl || 0) + plGbp) * 100) / 100;
         state.account.last_updated = new Date().toISOString();
 
-        await logStrategy(state, `CLOSED ${ticker} @ $${exitPrice} | P&L: ${plGbp >= 0 ? "+" : ""}£${plGbp.toFixed(2)} | ${body.reason || "Manual"}`);
+        const costNote = costBreakdown ? ` (gross £${costBreakdown.gross_pl_gbp}, costs £${costBreakdown.total_cost_gbp})` : "";
+        await logStrategy(state, `CLOSED ${ticker} @ $${exitPrice} | Net P&L: ${plGbp >= 0 ? "+" : ""}£${plGbp.toFixed(2)}${costNote} | ${body.reason || "Manual"}`);
 
-        // ═══ Mark setup tracker outcome for hit-rate calibration ═══
-        try {
-          const tracker = await kvGet("apex:setup_tracker") || { suggestions: [] };
-          let updated = false;
-          // Find most recent suggestion for this ticker where outcome is null and entry matches
-          for (let i = tracker.suggestions.length - 1; i >= 0; i--) {
-            const s = tracker.suggestions[i];
-            if (s.ticker === ticker && !s.outcome && Math.abs(s.entry - pos.entry_price) / s.entry < 0.03) {
-              s.outcome = {
-                exit_price: exitPrice,
-                pl_gbp: plGbp,
-                pl_pct: ((exitPrice - pos.entry_price) / pos.entry_price) * 100 * (pos.direction === "short" ? -1 : 1),
-                hit_t1: pos.direction === "buy" ? exitPrice >= s.t1 : exitPrice <= s.t1,
-                hit_stop: pos.direction === "buy" ? exitPrice <= s.stop : exitPrice >= s.stop,
-                exit_date: closed.exit_date,
-                reason: body.reason || "Manual close",
-              };
-              updated = true;
-              break;
-            }
-          }
-          if (updated) await kvSet("apex:setup_tracker", tracker);
-        } catch {}
+        // Mark setup tracker outcome (existing behavior)
+        await markSetupOutcome(ticker, pos.entry_price, exitPrice, pos.direction, closed.exit_date, body.reason);
+
+        // V5.0 FIX C3: feed adaptive learning with REAL signals (not synthetic)
+        const learningResult = await feedLearningFromClose(ticker, pos.entry_price, exitPrice, pos.units, pos.direction);
 
         const ok = await kvSet("apex:state", state);
-        return NextResponse.json({ ok, action: "close_position", closed });
+        return NextResponse.json({ ok, action: "close_position", closed, learning: learningResult });
       }
 
       case "partial_close": {
@@ -214,14 +307,40 @@ export async function POST(req) {
         const exitPrice = Number(body.exit_price) || pos.entry_price;
         const rawPL = calcPL(pos.entry_price, exitPrice, closeUnits, pos.direction);
         const gbpUsd = Number(state.account?.gbp_usd) || 1.34;
-        const plGbp = pos.currency === "GBP" ? rawPL : rawPL / gbpUsd;
+        const plGbpGross = pos.currency === "GBP" ? rawPL : rawPL / gbpUsd;
+
+        // V5.0: costModel for partial closes too
+        let plGbp = plGbpGross;
+        let costBreakdown = null;
+        try {
+          const daysHeld = pos.entry_date
+            ? Math.max(0, Math.ceil((Date.now() - new Date(pos.entry_date).getTime()) / 86400000))
+            : 0;
+          const tc = calculateTradeCosts(
+            ticker, pos.entry_price, exitPrice, closeUnits,
+            pos.direction || "buy", daysHeld, pos.currency || "USD"
+          );
+          if (tc && Number.isFinite(tc.net_pl_gbp)) {
+            plGbp = Math.round(tc.net_pl_gbp * 100) / 100;
+            costBreakdown = {
+              gross_pl_gbp: Math.round(plGbpGross * 100) / 100,
+              net_pl_gbp: plGbp,
+              total_cost_gbp: Math.round((plGbpGross - plGbp) * 100) / 100,
+              days_held: daysHeld,
+            };
+          }
+        } catch (e) { console.error("costModel partial error:", e.message); }
 
         const closed = {
           id: `${ticker}-partial-${Date.now()}`, ticker, name: pos.name, direction: pos.direction || "buy",
           entry_price: pos.entry_price, exit_price: exitPrice, units: closeUnits,
           sleeve: pos.sleeve, entry_date: pos.entry_date, exit_date: new Date().toISOString(),
-          net_pl: Math.round(plGbp * 100) / 100, reason: body.reason || "Partial close",
+          net_pl: Math.round(plGbp * 100) / 100,
+          gross_pl: Math.round(plGbpGross * 100) / 100,
+          costs: costBreakdown,
+          reason: body.reason || "Partial close",
           exit_type: "partial", thesis: pos.thesis,
+          signals_at_entry: pos.signals_at_entry || null,
         };
         if (!state.closed) state.closed = [];
         state.closed.push(closed);
@@ -229,7 +348,10 @@ export async function POST(req) {
         state.account.total_realised_pl = Math.round(((state.account.total_realised_pl || 0) + plGbp) * 100) / 100;
         state.account.last_updated = new Date().toISOString();
 
-        await logStrategy(state, `PARTIAL CLOSE ${ticker} ${closeUnits}u @ $${exitPrice} | P&L: ${plGbp >= 0 ? "+" : ""}£${plGbp.toFixed(2)}`);
+        await logStrategy(state, `PARTIAL CLOSE ${ticker} ${closeUnits}u @ $${exitPrice} | Net P&L: ${plGbp >= 0 ? "+" : ""}£${plGbp.toFixed(2)}`);
+
+        // Note: partial closes do NOT feed adaptive learning (only final close does)
+        // to avoid over-weighting trades that close in multiple stages.
 
         const ok = await kvSet("apex:state", state);
         return NextResponse.json({ ok, action: "partial_close", closed, remaining: state.positions[idx].units });
@@ -287,7 +409,6 @@ export async function POST(req) {
         return NextResponse.json({ ok: true, count: knowledge.length });
       }
 
-      // ═══ STRATEGY MEMORY ═══
       case "add_strategy_note": {
         if (!state.strategy_log) state.strategy_log = [];
         state.strategy_log.push({
@@ -305,7 +426,6 @@ export async function POST(req) {
         return NextResponse.json({ log: state.strategy_log || [], count: (state.strategy_log || []).length });
       }
 
-      // ═══ PIPELINE MANAGEMENT ═══
       case "remove_pipeline": {
         const ticker = (body.ticker || body.candidate || "").toUpperCase();
         if (!ticker) return NextResponse.json({ error: "Missing ticker" }, { status: 400 });
@@ -348,7 +468,6 @@ export async function POST(req) {
         return NextResponse.json({ ok, action: "add_pipeline", entry });
       }
 
-      // ═══ ACTIVE PIPELINE MANAGEMENT (user-approved opportunities ready to execute) ═══
       case "promote_to_active": {
         const candidate = (body.candidate || body.ticker || "").toUpperCase();
         if (!candidate) return NextResponse.json({ error: "Missing ticker" }, { status: 400 });
@@ -368,7 +487,6 @@ export async function POST(req) {
           grade: body.grade || "",
           thesis: body.thesis || "",
           sleeve: body.sleeve || "B",
-          // Setup metadata (passed through from scanner via UI promote button)
           suggested_units: body.suggested_units != null ? Number(body.suggested_units) : null,
           risk_gbp: body.risk_gbp != null ? Number(body.risk_gbp) : null,
           pct_nav_at_risk: body.pct_nav_at_risk != null ? Number(body.pct_nav_at_risk) : null,
@@ -379,6 +497,8 @@ export async function POST(req) {
           entry_trigger: body.entry_trigger || "",
           ai_verdict: body.ai_verdict || "",
           days_to_earnings: body.days_to_earnings ?? null,
+          // V5.0: preserve signals_at_entry from scanner setup tracker
+          signals_at_entry: body.signals_at_entry || null,
           promoted_at: new Date().toISOString(),
           source: body.source || "apex_scan",
         };
@@ -413,7 +533,6 @@ export async function POST(req) {
         const ticker = (body.ticker || "").toUpperCase();
         if (!ticker) return NextResponse.json({ error: "Missing ticker" }, { status: 400 });
         let dismissed = await kvGet("apex:dismissed") || { tickers: [], until: null };
-        // 15 min window — matches scanner cron
         const until = new Date(Date.now() + 15 * 60 * 1000).toISOString();
         if (!dismissed.tickers.includes(ticker)) dismissed.tickers.push(ticker);
         dismissed.until = until;
@@ -431,20 +550,19 @@ export async function POST(req) {
       case "get_setup_tracker": {
         const tracker = await kvGet("apex:setup_tracker") || { suggestions: [] };
         const withOutcome = tracker.suggestions.filter(s => s.outcome);
-        const wins = withOutcome.filter(s => s.outcome.hit_t1 || s.outcome.pl_gbp > 0);
-        const losses = withOutcome.filter(s => !s.outcome.hit_t1 && s.outcome.pl_gbp <= 0);
-        const totalPL = withOutcome.reduce((a, s) => a + (s.outcome.pl_gbp || 0), 0);
+        const wins = withOutcome.filter(s => s.outcome.hit_t1 || (s.outcome.pl_pct || 0) > 0);
+        const losses = withOutcome.filter(s => !s.outcome.hit_t1 && (s.outcome.pl_pct || 0) <= 0);
         const byGrade = {};
         for (const s of withOutcome) {
           const g = s.grade || "?";
-          if (!byGrade[g]) byGrade[g] = { total: 0, wins: 0, avg_pl: 0, pl_sum: 0 };
+          if (!byGrade[g]) byGrade[g] = { total: 0, wins: 0, pl_sum: 0 };
           byGrade[g].total++;
-          if (s.outcome.hit_t1 || s.outcome.pl_gbp > 0) byGrade[g].wins++;
-          byGrade[g].pl_sum += s.outcome.pl_gbp || 0;
+          if (s.outcome.hit_t1 || (s.outcome.pl_pct || 0) > 0) byGrade[g].wins++;
+          byGrade[g].pl_sum += s.outcome.pl_pct || 0;
         }
         for (const g of Object.keys(byGrade)) {
           byGrade[g].win_rate = byGrade[g].total ? (byGrade[g].wins / byGrade[g].total * 100).toFixed(0) + "%" : "0%";
-          byGrade[g].avg_pl = byGrade[g].total ? (byGrade[g].pl_sum / byGrade[g].total).toFixed(2) : "0";
+          byGrade[g].avg_pl_pct = byGrade[g].total ? (byGrade[g].pl_sum / byGrade[g].total).toFixed(2) : "0";
         }
         return NextResponse.json({
           total_suggestions: tracker.suggestions.length,
@@ -453,7 +571,6 @@ export async function POST(req) {
           wins: wins.length,
           losses: losses.length,
           win_rate: withOutcome.length ? (wins.length / withOutcome.length * 100).toFixed(0) + "%" : "N/A",
-          total_pl: totalPL.toFixed(2),
           by_grade: byGrade,
           recent: tracker.suggestions.slice(-20),
         });
@@ -467,11 +584,9 @@ export async function POST(req) {
         if (idx < 0) return NextResponse.json({ error: `${ticker} not in active pipeline` }, { status: 404 });
         const entry = state.active_pipeline[idx];
 
-        // If no explicit values provided, auto-refresh from live scanner
         const hasExplicit = body.entry_price != null || body.stop != null || body.t1 != null || body.t2 != null;
         if (!hasExplicit) {
           try {
-            // Prefer explicit BASE_URL (production), fallback to req origin
             const host = process.env.BASE_URL || (() => { try { return new URL(req.url).origin; } catch { return null; } })();
             if (!host) {
               entry.refresh_failed = true;
@@ -495,7 +610,6 @@ export async function POST(req) {
                   entry.rsi = opp.rsi;
                   entry.score = opp.score;
                   entry.grade = opp.grade;
-                  // Read from setup aliases (now matched to scanner output shape)
                   entry.suggested_units = opp.setup.suggested_units;
                   entry.risk_gbp = opp.setup.risk_gbp;
                   entry.pct_nav_at_risk = opp.setup.pct_nav_at_risk;
@@ -552,7 +666,6 @@ export async function POST(req) {
   }
 }
 
-// ═══ STRATEGY LOG HELPER ═══
 async function logStrategy(state, note) {
   if (!state.strategy_log) state.strategy_log = [];
   state.strategy_log.push({
