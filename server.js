@@ -52,22 +52,26 @@ cron.schedule("*/5 14-21 * * 1-5", async () => {
   }
 }, { timezone: "Europe/London" });
 
-// 3: MORNING BRIEF (07:00) — now includes regime + peace signal
+// 3: MORNING BRIEF (07:00)
+// V5.0: regime is stored FLAT at apex:regime; peace_signal now works end-to-end.
 cron.schedule("0 7 * * 1-5", async () => {
   console.log("[BRIEF] Generating...");
-  const [brief, regime, peace] = await Promise.all([
+  const [brief, regimeResp, peaceResp] = await Promise.all([
     callAPI("/api/chat", "POST", { messages: [{ role: "user", content: "Give me my morning brief" }] }),
     callAPI("/api/regime"),
     callAPI("/api/altdata?source=peace_signal"),
   ]);
 
   let msg = `☀️ *MORNING BRIEF*\n\n`;
-  if (regime?.current) {
-    msg += `*Regime:* ${regime.current.primary_regime} (${regime.current.confidence}% conf)\n`;
-    if (regime.shift?.shift_detected) msg += `🔥 *REGIME SHIFT:* ${regime.shift.from} → ${regime.shift.to}\n`;
+  // regime route returns { current, previous, shift }
+  const regime = regimeResp?.current;
+  if (regime?.primary_regime) {
+    msg += `*Regime:* ${regime.primary_regime} (${regime.confidence || "?"}% conf)\n`;
+    if (regimeResp?.shift?.shift_detected) msg += `🔥 *REGIME SHIFT:* ${regimeResp.shift.from} → ${regimeResp.shift.to}\n`;
   }
-  if (peace?.peace_signal) {
-    msg += `*Peace Signal:* ${peace.peace_signal.score}/8 — ${peace.peace_signal.action}\n\n`;
+  const peace = peaceResp?.peace_signal;
+  if (peace?.score != null) {
+    msg += `*Peace Signal:* ${peace.score}/${peace.max_score || 8} — ${peace.action}\n\n`;
   }
   if (brief?.content) msg += brief.content.slice(0, 3000);
   await tg(msg);
@@ -107,13 +111,21 @@ cron.schedule("15 21 * * 1-5", async () => {
 cron.schedule("0 20 * * 0", async () => { await tg("📋 *WEEKLY REVIEW*\nOpen APEX and type: _weekly review_"); }, { timezone: "Europe/London" });
 
 // 7: SCANNER (30min market hours)
+// V5.0 FIX C6: scanner returns `actionable` (alias for actionable_raw).
+// Old code read `d.actionable` which was undefined — Telegram scanner alerts
+// have NEVER fired in production. This now works.
 cron.schedule("*/30 8-21 * * 1-5", async () => {
   const d = await callAPI("/api/scanner");
-  if (d?.actionable > 0) {
-    const top = (d.top5 || []).slice(0, 3).map(t => `${t.ticker}: ${t.score}/100`).join("\n");
-    await tg(`🔍 *SCANNER* — ${d.scanned} scanned, ${d.actionable} actionable\n\n${top}`);
+  const actionable = d?.actionable ?? d?.actionable_raw ?? 0;
+  const valid = d?.passing_rr ?? 0;
+  if (valid > 0) {
+    const top = (d.top5 || []).slice(0, 3).map(t => `${t.ticker}: ${t.score}/100 ${t.grade}`).join("\n");
+    let body = `🔍 *SCANNER* — ${d.scanned} scanned, ${valid} valid (${actionable} actionable)\n\n${top}`;
+    if (d.ai_vetoes) body += `\n\nClaude vetoed ${d.ai_vetoes} setups`;
+    if (d.suspect_data_tickers?.length) body += `\n⚠️ Bad data on ${d.suspect_data_tickers.length} tickers`;
+    await tg(body);
   }
-  console.log(`[SCANNER] ${d?.scanned || 0} tickers`);
+  console.log(`[SCANNER] ${d?.scanned || 0} scanned, ${valid} valid, ${actionable} actionable, ${d?.ai_vetoes || 0} vetoed`);
 }, { timezone: "Europe/London" });
 
 // 8: CLEANUP (03:00)
@@ -122,10 +134,11 @@ cron.schedule("0 3 * * *", () => { console.log("[CLEANUP] Daily maintenance"); }
 // ═══ V4 NEW CRONS ═══
 
 // 9: REGIME DETECTION (hourly during market hours)
+// V5.0: regime route returns { current, previous, shift }
 cron.schedule("0 8-21 * * 1-5", async () => {
   const d = await callAPI("/api/regime");
   if (d?.shift?.shift_detected) {
-    await tg(`🔥 *REGIME SHIFT DETECTED*\n\nFrom: ${d.shift.from}\nTo: ${d.shift.to}\nConfidence: ${d.current.confidence}%\n\n_${d.shift.action_required}_`);
+    await tg(`🔥 *REGIME SHIFT DETECTED*\n\nFrom: ${d.shift.from}\nTo: ${d.shift.to}\nConfidence: ${d.current?.confidence || "?"}%\n\n_${d.shift.action_required}_`);
   }
   console.log(`[REGIME] ${d?.current?.primary_code || 'unknown'}`);
 }, { timezone: "Europe/London" });
@@ -138,38 +151,47 @@ cron.schedule("*/15 8-21 * * 1-5", async () => {
   }
 }, { timezone: "Europe/London" });
 
-// 10: PEACE SIGNAL (twice daily — 09:00 and 17:00)
+// 11: PEACE SIGNAL (twice daily — 09:00 and 17:00)
+// V5.0: altDataMonitor is now functional — this actually works.
 cron.schedule("0 9,17 * * 1-5", async () => {
   const d = await callAPI("/api/altdata?source=peace_signal");
-  if (d?.peace_signal?.score >= 3) {
-    await tg(`🕊️ *PEACE SIGNAL ALERT*\n\nScore: ${d.peace_signal.score}/8\n${d.peace_signal.action}\n\nTrump: ${d.peace_signal.components?.trump}\nHormuz: ${d.peace_signal.components?.hormuz}\nInsurance: ${d.peace_signal.components?.insurance}`);
+  const score = d?.peace_signal?.score || 0;
+  if (score >= 3) {
+    const comp = d.peace_signal.components || {};
+    await tg(`🕊️ *PEACE SIGNAL ALERT*\n\nScore: ${score}/${d.peace_signal.max_score || 8}\n${d.peace_signal.action}\n\nTrump tone: ${comp.trump}\nHormuz: ${comp.hormuz}\nInsurance: ${comp.insurance}\nQatar: ${comp.qatar}\nBrent: ${comp.brent}`);
   }
-  console.log(`[PEACE] Score: ${d?.peace_signal?.score || 0}/8`);
+  console.log(`[PEACE] Score: ${score}/${d?.peace_signal?.max_score || 8}`);
 }, { timezone: "Europe/London" });
 
-// 11: STRATEGY ENGINE (daily at 06:30 — pre-brief)
+// 12: STRATEGY ENGINE (daily at 06:30)
 cron.schedule("30 6 * * 1-5", async () => {
   const d = await callAPI("/api/strategy");
-  console.log(`[STRATEGY] ${d?.total_recommendations || 0} recommendations for ${d?.regime_full}`);
+  console.log(`[STRATEGY] ${d?.total_recommendations || 0} recommendations for ${d?.regime_full || d?.regime}`);
 }, { timezone: "Europe/London" });
 
-// 12: ADAPTIVE LEARNING REBUILD (daily 02:00 — outside market hours)
+// 13: ADAPTIVE LEARNING — no longer "rebuild_from_closed" (which synthesised fake data).
+// V5.0 FIX C3: Real signals are now written to setup_tracker at scan time and fed
+// through /api/state close_position. The daily cron now just reports calibration stats.
 cron.schedule("0 2 * * *", async () => {
-  const d = await callAPI("/api/adaptive", "POST", { action: "rebuild_from_closed" });
-  console.log(`[LEARN] Rebuilt from ${d?.rebuilt_from || 0} closed trades`);
+  const d = await callAPI("/api/adaptive");
+  const summary = d?.summary;
+  if (summary?.sample_size >= 10) {
+    console.log(`[LEARN] ${summary.sample_size} samples, Brier ${summary.brier_score}, accuracy ${summary.accuracy}%`);
+  } else {
+    console.log(`[LEARN] ${summary?.sample_size || 0} samples (need 10+ for signal)`);
+  }
 }, { timezone: "Europe/London" });
 
 // START
 app.prepare().then(() => {
   createServer((req, res) => { handle(req, res, parse(req.url, true)); }).listen(port, "0.0.0.0", () => {
-    console.log(`\n🧠 APEX BRAIN V4.6 CEILING on port ${port} | ${dev ? "dev" : "production"} | TG: ${TG_TOKEN ? "YES" : "NO"} | 13 crons\n`);
+    console.log(`\n🧠 APEX BRAIN V5.0 on port ${port} | ${dev ? "dev" : "production"} | TG: ${TG_TOKEN ? "YES" : "NO"} | 13 crons\n`);
     if (TG_TOKEN && TG_CHAT) {
-      tg("🧠 *APEX V4.6 CEILING STARTED*\n\n13 crons active:\n• Prices (5min)\n• Risk monitor (5min)\n• Agentic PM loop (15min)\n• Morning brief (07:00)\n• Earnings (12:00)\n• Overnight (21:15)\n• Weekly (Sun 20:00)\n• Scanner (30min)\n• Regime detection (hourly)\n• Peace signal (09:00, 17:00)\n• Strategy engine (06:30)\n• Adaptive learning (02:00)\n• Cleanup (03:00)\n\nType /help for commands");
+      tg("🧠 *APEX V5.0 STARTED*\n\n*Critical fixes deployed:*\n• changePct bug (no more phantom moves)\n• Regime detection wired correctly\n• Adaptive learning fed from real trades\n• Peace signal framework FUNCTIONAL\n• Scanner Telegram alerts now fire\n• Health check KV keys corrected\n• Vetoed setups preserved for audit\n\n13 crons active. Type /help for commands.");
     }
-    // Start Telegram bidirectional polling (works without HTTPS)
     try {
       const { startTelegramPolling } = require("./telegramPoll.js");
-      setTimeout(() => startTelegramPolling(), 3000); // delay 3s so routes are ready
+      setTimeout(() => startTelegramPolling(), 3000);
     } catch (e) { console.error("Telegram polling not started:", e.message); }
   });
 });
