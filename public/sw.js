@@ -1,5 +1,6 @@
 // APEX BRAIN Service Worker — minimal shell cache for PWA install
-const CACHE = 'apex-v4-6';
+// V5.0: cache version bumped to force browsers to drop stale V4.x shell.
+const CACHE = 'apex-v5-0';
 const ASSETS = ['/', '/manifest.json'];
 
 self.addEventListener('install', e => {
