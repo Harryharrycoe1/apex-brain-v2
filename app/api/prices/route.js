@@ -1,6 +1,12 @@
+// APEX BRAIN V5.1 — PRICES ROUTE
+// V5.0 fixes: C1 (chartPreviousClose bug), S3 (stale extended-hours quote filter)
+// V5.1 adds: trailing stop worker — auto-advances trailing stops on every price tick,
+// persists to KV, logs advances/breaches to strategy log.
+
 import { NextResponse } from "next/server";
 import { WATCHLIST, PENCE_SYMBOLS } from "../../data/algoConfig.js";
 import { DEFAULT_STATE } from "../../data/fundState.js";
+import { processTrailingStops, formatTrailingUpdates } from "../../lib/trailingStopWorker.js";
 
 export const maxDuration = 30;
 
@@ -176,6 +182,50 @@ export async function GET(req) {
       await kvSet("apex:price_errors", errorLog);
     }
 
+    // V5.1: Process trailing stops on every price tick.
+    // Mutates state.positions in-place. Persist + log if any advanced or breached.
+    let trailingUpdates = [];
+    try {
+      trailingUpdates = processTrailingStops(state, results);
+      if (trailingUpdates.length > 0) {
+        // Persist the updated state (positions now have new trailing_stop / HWM values)
+        state.account = state.account || {};
+        state.account.last_updated = now.toISOString();
+        await kvSet("apex:state", state);
+
+        // Log to strategy log if any breach or meaningful advance
+        const breached = trailingUpdates.filter(u => u.breached);
+        const advanced = trailingUpdates.filter(u => u.advanced && !u.breached);
+        if (breached.length || advanced.length) {
+          const log = await kvGet("apex:state") ? (state.strategy_log || []) : [];
+          if (breached.length) {
+            for (const b of breached) {
+              log.push({
+                date: now.toISOString(),
+                note: `🚨 TRAILING STOP BREACHED: ${b.ticker} — price crossed trailing stop at $${b.new_stop}. CLOSE MANUALLY ON T212.`,
+                category: "risk_alert",
+                author: "trailing_worker",
+              });
+            }
+          }
+          if (advanced.length) {
+            for (const a of advanced) {
+              log.push({
+                date: now.toISOString(),
+                note: `🔒 Trailing stop advanced: ${a.ticker} $${a.old_stop || "init"} → $${a.new_stop} (HWM $${a.hwm}, ${a.trail_pct}%)`,
+                category: "trailing_update",
+                author: "trailing_worker",
+              });
+            }
+          }
+          state.strategy_log = log.slice(-200);
+          await kvSet("apex:state", state);
+        }
+      }
+    } catch (e) {
+      console.error("Trailing stop worker error:", e.message);
+    }
+
     return NextResponse.json({
       prices: results,
       timestamp: now.toISOString(),
@@ -186,6 +236,8 @@ export async function GET(req) {
       errors: errors.length > 0 ? errors : undefined,
       elapsed_ms: elapsed,
       market_state: results.SPX?.marketState || "UNKNOWN",
+      // V5.1: expose trailing stop updates so UI can show breach alerts
+      trailing_updates: trailingUpdates.length > 0 ? trailingUpdates : undefined,
     });
   } catch (err) {
     return NextResponse.json({ error: err.message }, { status: 500 });
