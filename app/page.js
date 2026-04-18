@@ -223,12 +223,22 @@ export default function ApexBrain(){
             <button onClick={()=>setShowAdd(true)} style={{padding:"5px 12px",background:T.gold,color:"#000",fontWeight:700,border:"none",borderRadius:6,fontSize:11,cursor:"pointer"}}><Plus size={12}/> Add</button>
           </div>
           {positionsWithPL.map((pos,i)=>{const up=pos.plGbp>=0;const dir=(pos.direction||"buy").toUpperCase();
-            // V5.1: Trailing stop state
-            const hasTrailing=pos.trailing_stop!=null&&pos.trailing_stop_pct!=null;
+            // V5.1 dual-mode trailing detection
+            const trailMode=pos.trailing_stop_mode||(pos.trailing_stop_distance!=null?"distance":pos.trailing_stop_pct!=null?"pct":null);
+            const hasTrailing=pos.trailing_stop!=null&&trailMode!=null;
             const effectiveStop=hasTrailing?pos.trailing_stop:pos.stop;
             const trailBreached=hasTrailing&&pos.livePrice!=null&&(
               (pos.direction==="buy"||pos.direction==="long"||!pos.direction)?pos.livePrice<=pos.trailing_stop:pos.livePrice>=pos.trailing_stop
             );
+            // Compute badge values: show both distance and %
+            const curr=pos.currency==="GBP"?"£":"$";
+            const effDistance=hasTrailing&&pos.trailing_stop_hwm?Math.abs(pos.trailing_stop_hwm-pos.trailing_stop):null;
+            const effPct=hasTrailing&&pos.trailing_stop_hwm&&pos.trailing_stop_hwm>0?(effDistance/pos.trailing_stop_hwm)*100:null;
+            const badgeText=trailMode==="distance"
+              ?`🔒 ${curr}${fmt(pos.trailing_stop_distance)}${effPct!=null?` / ${fmt(effPct,1)}%`:""}`
+              :trailMode==="pct"
+              ?`🔒 ${pos.trailing_stop_pct}%${effDistance!=null?` / ${curr}${fmt(effDistance)}`:""}`
+              :"🔒 TRAIL";
             const cardBorder=trailBreached?T.red:(pos.stopDist!=null&&pos.stopDist<5&&!hasTrailing)?T.red:hasTrailing?T.green:T.border;
             return(
             <div key={i} style={{padding:"8px 10px",background:T.card,borderRadius:8,marginBottom:6,border:`1px solid ${cardBorder}`}}>
@@ -236,21 +246,21 @@ export default function ApexBrain(){
                 <div style={{display:"flex",alignItems:"center",gap:4,flexWrap:"wrap"}}>
                   <span style={{fontSize:14,fontWeight:700,color:T.text}}>{pos.id}</span>
                   <span style={{fontSize:9,color:T.textDim}}>[{pos.sleeve}/{dir}]</span>
-                  {hasTrailing&&!trailBreached&&<span style={{padding:"1px 5px",background:T.green+"20",color:T.green,borderRadius:3,fontSize:8,fontWeight:700,letterSpacing:0.5}} title={`Trailing ${pos.trailing_stop_pct}% below HWM $${fmt(pos.trailing_stop_hwm)}`}>🔒 TRAIL {pos.trailing_stop_pct}%</span>}
+                  {hasTrailing&&!trailBreached&&<span style={{padding:"1px 5px",background:T.green+"20",color:T.green,borderRadius:3,fontSize:8,fontWeight:700,letterSpacing:0.5}} title={`${trailMode==="distance"?"Distance-based":"Percentage-based"} trailing stop | HWM ${curr}${fmt(pos.trailing_stop_hwm)} | Stop ${curr}${fmt(pos.trailing_stop)}`}>{badgeText}</span>}
                   {trailBreached&&<span style={{padding:"1px 5px",background:T.red+"20",color:T.red,borderRadius:3,fontSize:8,fontWeight:700,letterSpacing:0.5}}>🚨 BREACHED</span>}
                 </div>
                 <div style={{display:"flex",gap:4}}>
                   <button onClick={()=>setClosePos({ticker:pos.id,units:pos.units,max_units:pos.units,entry_price:pos.entry_price,current_price:pos.livePrice,direction:pos.direction,sleeve:pos.sleeve,currency:pos.currency,exit_price:pos.livePrice||pos.entry_price})} title="Close position" style={{...btnS,width:24,height:24,background:T.red+"20"}}><X size={10} color={T.red}/></button>
-                  <button onClick={()=>setEditPos({ticker:pos.id,stop:pos.stop||"",t1:pos.t1||"",t2:pos.t2||"",units:pos.units,sleeve:pos.sleeve,direction:pos.direction||"buy",thesis:pos.thesis||"",conviction:pos.conviction||3,trailing_stop_pct:pos.trailing_stop_pct||"",trailing_stop:pos.trailing_stop||"",trailing_stop_hwm:pos.trailing_stop_hwm||""})} style={{...btnS,width:24,height:24}}><Edit3 size={10} color={T.textDim}/></button>
+                  <button onClick={()=>setEditPos({ticker:pos.id,stop:pos.stop||"",t1:pos.t1||"",t2:pos.t2||"",units:pos.units,sleeve:pos.sleeve,direction:pos.direction||"buy",thesis:pos.thesis||"",conviction:pos.conviction||3,currency:pos.currency||"USD",trailing_stop_mode:pos.trailing_stop_mode||"",trailing_stop_distance:pos.trailing_stop_distance||"",trailing_stop_pct:pos.trailing_stop_pct||"",trailing_stop:pos.trailing_stop||"",trailing_stop_hwm:pos.trailing_stop_hwm||""})} style={{...btnS,width:24,height:24}}><Edit3 size={10} color={T.textDim}/></button>
                 </div>
               </div>
               <div style={{display:"flex",justifyContent:"space-between",marginTop:3,fontSize:12,fontFamily:T.mono}}>
-                <span style={{color:T.text}}>Entry: ${pos.entry_price} → {pos.livePrice!=null?`$${fmt(pos.livePrice)}`:"—"}</span>
+                <span style={{color:T.text}}>Entry: {curr}{pos.entry_price} → {pos.livePrice!=null?`${curr}${fmt(pos.livePrice)}`:"—"}</span>
                 <span style={{color:up?T.green:T.red,fontWeight:700}}>{up?"+":""}£{fmt(pos.plGbp)} ({up?"+":""}{fmt(pos.plPct,1)}%)</span>
               </div>
               <div style={{display:"flex",justifyContent:"space-between",marginTop:2,fontSize:10,color:T.textDim}}>
-                <span>{hasTrailing?<><span style={{color:T.green}}>🔒 Trail: ${fmt(pos.trailing_stop)}</span> (HWM ${fmt(pos.trailing_stop_hwm)})</>:<>Stop: ${pos.stop||"—"} ({pos.stopDist!=null?fmt(pos.stopDist,1)+"% away":"no stop"})</>}</span>
-                <span>T1: ${pos.t1||"—"} {pos.t1Dist!=null&&pos.t1Dist<5?"🟢":""}</span>
+                <span>{hasTrailing?<><span style={{color:T.green}}>🔒 Trail: {curr}{fmt(pos.trailing_stop)}</span> (HWM {curr}{fmt(pos.trailing_stop_hwm)})</>:<>Stop: {curr}{pos.stop||"—"} ({pos.stopDist!=null?fmt(pos.stopDist,1)+"% away":"no stop"})</>}</span>
+                <span>T1: {curr}{pos.t1||"—"} {pos.t1Dist!=null&&pos.t1Dist<5?"🟢":""}</span>
               </div>
               {pos.thesis&&<div style={{fontSize:10,color:T.textDim,marginTop:3,fontStyle:"italic"}}>{pos.thesis}</div>}
             </div>);})}
@@ -809,21 +819,39 @@ export default function ApexBrain(){
           <Sel v={editPos.direction} c={v=>setEditPos(p=>({...p,direction:v}))} opts={[["buy","LONG"],["short","SHORT"]]}/>
           <Inp p="Conviction (1-4)" v={editPos.conviction} c={v=>setEditPos(p=>({...p,conviction:v}))} t="number"/>
         </div>
-        {/* V5.1: Trailing stop controls */}
-        <div style={{marginTop:10,padding:"8px 10px",background:T.card,borderRadius:8,border:`1px solid ${editPos.trailing_stop_pct?T.green:T.border}`}}>
-          <div style={{fontSize:10,color:editPos.trailing_stop_pct?T.green:T.textDim,fontWeight:700,letterSpacing:1,marginBottom:6}}>
-            🔒 TRAILING STOP {editPos.trailing_stop_pct?"(ACTIVE)":"(inactive — set % to enable)"}
-          </div>
-          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6}}>
-            <Inp p="Trail %" v={editPos.trailing_stop_pct} c={v=>setEditPos(p=>({...p,trailing_stop_pct:v}))} t="number"/>
-            <Inp p="Trail Stop $ (auto)" v={editPos.trailing_stop} c={v=>setEditPos(p=>({...p,trailing_stop:v}))} t="number"/>
-          </div>
-          <div style={{fontSize:9,color:T.textDim,marginTop:4,lineHeight:1.4}}>
-            Set Trail % (e.g. 5 = 5% below high-water-mark). Stop auto-advances on price rises, never drops.
-            {editPos.trailing_stop_hwm?` Current HWM: $${editPos.trailing_stop_hwm}`:" HWM will be set from first price tick."}
-          </div>
-          {editPos.trailing_stop_pct&&<button onClick={()=>setEditPos(p=>({...p,trailing_stop_pct:"",trailing_stop:"",trailing_stop_hwm:""}))} style={{marginTop:6,padding:"4px 8px",background:T.cardHover,border:`1px solid ${T.red}`,borderRadius:4,color:T.red,fontSize:10,cursor:"pointer"}}>Disable Trailing</button>}
-        </div>
+        {/* V5.1: Dual-mode trailing stop controls (distance $ OR percentage) */}
+        {(()=>{
+          const curr=editPos.currency==="GBP"?"£":"$";
+          const mode=editPos.trailing_stop_mode||"";
+          const hasActive=mode&&(mode==="distance"?editPos.trailing_stop_distance:editPos.trailing_stop_pct);
+          return(
+          <div style={{marginTop:10,padding:"8px 10px",background:T.card,borderRadius:8,border:`1px solid ${hasActive?T.green:T.border}`}}>
+            <div style={{fontSize:10,color:hasActive?T.green:T.textDim,fontWeight:700,letterSpacing:1,marginBottom:6}}>
+              🔒 TRAILING STOP {hasActive?"(ACTIVE)":"(inactive — pick a mode below)"}
+            </div>
+            <div style={{display:"flex",gap:4,marginBottom:6}}>
+              <button onClick={()=>setEditPos(p=>({...p,trailing_stop_mode:"distance",trailing_stop_pct:""}))} style={{flex:1,padding:"6px 8px",background:mode==="distance"?T.gold:T.cardHover,color:mode==="distance"?"#000":T.text,border:`1px solid ${mode==="distance"?T.gold:T.border}`,borderRadius:6,fontSize:11,fontWeight:700,cursor:"pointer"}}>Distance {curr}</button>
+              <button onClick={()=>setEditPos(p=>({...p,trailing_stop_mode:"pct",trailing_stop_distance:""}))} style={{flex:1,padding:"6px 8px",background:mode==="pct"?T.gold:T.cardHover,color:mode==="pct"?"#000":T.text,border:`1px solid ${mode==="pct"?T.gold:T.border}`,borderRadius:6,fontSize:11,fontWeight:700,cursor:"pointer"}}>Percentage %</button>
+            </div>
+            {mode==="distance"&&(
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6}}>
+                <Inp p={`Distance ${curr}`} v={editPos.trailing_stop_distance} c={v=>setEditPos(p=>({...p,trailing_stop_distance:v}))} t="number"/>
+                <Inp p={`Trail Stop ${curr} (auto)`} v={editPos.trailing_stop} c={v=>setEditPos(p=>({...p,trailing_stop:v}))} t="number"/>
+              </div>
+            )}
+            {mode==="pct"&&(
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6}}>
+                <Inp p="Trail %" v={editPos.trailing_stop_pct} c={v=>setEditPos(p=>({...p,trailing_stop_pct:v}))} t="number"/>
+                <Inp p={`Trail Stop ${curr} (auto)`} v={editPos.trailing_stop} c={v=>setEditPos(p=>({...p,trailing_stop:v}))} t="number"/>
+              </div>
+            )}
+            <div style={{fontSize:9,color:T.textDim,marginTop:4,lineHeight:1.4}}>
+              {mode==="distance"?`T212-style: stop stays ${curr}X below high-water-mark. E.g. ${curr}3 means $3 below HWM.`:mode==="pct"?`Percentage-based: stop = HWM × (1 - N/100). E.g. 5 = 5% below HWM.`:`Pick Distance (T212 style) or Percentage to enable trailing.`}
+              {editPos.trailing_stop_hwm?` | HWM: ${curr}${editPos.trailing_stop_hwm}`:hasActive?` | HWM will be set from first price tick.`:""}
+            </div>
+            {hasActive&&<button onClick={()=>setEditPos(p=>({...p,trailing_stop_mode:"",trailing_stop_distance:"",trailing_stop_pct:"",trailing_stop:"",trailing_stop_hwm:""}))} style={{marginTop:6,padding:"4px 8px",background:T.cardHover,border:`1px solid ${T.red}`,borderRadius:4,color:T.red,fontSize:10,cursor:"pointer"}}>Disable Trailing</button>}
+          </div>);
+        })()}
         <Inp p="Thesis" v={editPos.thesis} c={v=>setEditPos(p=>({...p,thesis:v}))} full/>
         <Btn onClick={saveEdit}>Save Changes</Btn>
       </Modal>}
