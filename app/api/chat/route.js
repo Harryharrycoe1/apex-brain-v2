@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { BRAINSTEM, AMYGDALA_PREAMBLE } from "../../data/brainstem.js";
+import { buildBrainstem, AMYGDALA_PREAMBLE } from "../../data/brainstem.js";
 import { ROUTER_PROMPT } from "../../data/router.js";
 import { PATHWAYS } from "../../data/pathways.js";
 import { getCortexSections } from "../../data/cortex.js";
@@ -7,6 +7,13 @@ import { AMYGDALA_PROMPT } from "../../data/amygdala.js";
 import { DEFAULT_STATE } from "../../data/fundState.js";
 import { WATCHLIST, PENCE_SYMBOLS } from "../../data/algoConfig.js";
 import { runAlgoEngine } from "../../lib/algoInline.js";
+
+// V5.0: KV reader for peace signal (passed to cortex + brainstem for dynamic sections)
+async function kvGetLocal(key) {
+  const url = process.env.KV_REST_API_URL, token = process.env.KV_REST_API_TOKEN;
+  if (!url || !token) return null;
+  try { const r = await fetch(`${url}/get/${key}`, { headers: { Authorization: `Bearer ${token}` } }); if (!r.ok) return null; const d = await r.json(); let v = d.result; for (let i = 0; i < 3; i++) { if (typeof v === "string") { try { v = JSON.parse(v); } catch { break; } } else break; } return v; } catch { return null; }
+}
 
 export const maxDuration = 120;
 const API_KEY = process.env.ANTHROPIC_API_KEY;
@@ -358,8 +365,72 @@ async function kvGet(key) {
 }
 
 // === YAHOO ===
+// V5.0 FIX (C1): Previous version used range=2d which sometimes returns only 1 bar,
+// making chartPreviousClose year-ago when that's the only available ref.
+// Now fetches 5d and derives true yesterday close from the bar array.
+// V5.0 FIX (S3): Added 10% sanity window — if extended-hours quote diverges >10%
+// from regular-hours price, ignore it (stale or bad quote).
 async function fetchYahoo(symbol) {
-  try{const r=await fetch("https://query1.finance.yahoo.com/v8/finance/chart/"+encodeURIComponent(symbol)+"?interval=1d&range=2d&includePrePost=true",{headers:{"User-Agent":"Mozilla/5.0"}});if(!r.ok)return null;const data=await r.json();const meta=data?.chart?.result?.[0]?.meta;if(!meta?.regularMarketPrice)return null;let price=Number(meta.regularMarketPrice);let prev=Number(meta.chartPreviousClose||meta.previousClose)||price;let pre=meta.preMarketPrice?Number(meta.preMarketPrice):null;let post=meta.postMarketPrice?Number(meta.postMarketPrice):null;if(PENCE_SYMBOLS.includes(symbol)){price/=100;prev/=100;if(pre)pre/=100;if(post)post/=100;}if(!isFinite(price))return null;const eff=post||pre||price;return{price:eff,regular:price,preMarket:pre,postMarket:post,prevClose:prev,changePct:parseFloat($(prev?((eff-prev)/prev*100):0)),currency:PENCE_SYMBOLS.includes(symbol)?"GBP":meta.currency,marketState:meta.marketState};}catch{return null;}
+  try {
+    const r = await fetch(
+      "https://query1.finance.yahoo.com/v8/finance/chart/" + encodeURIComponent(symbol) +
+      "?interval=1d&range=5d&includePrePost=true",
+      { headers: { "User-Agent": "Mozilla/5.0" }, signal: AbortSignal.timeout(8000) }
+    );
+    if (!r.ok) return null;
+    const data = await r.json();
+    const result = data?.chart?.result?.[0];
+    const meta = result?.meta;
+    if (!meta?.regularMarketPrice) return null;
+
+    // Derive true yesterday close from bar data (not chartPreviousClose)
+    const closes = (result?.indicators?.quote?.[0]?.close || []).filter(c => c != null);
+    let price = Number(meta.regularMarketPrice);
+    // Prev close = last closed bar (not today's live bar). If only 1 bar, use meta.
+    let prev;
+    if (closes.length >= 2) {
+      // Last bar in array may be today's live/incomplete bar; prefer second-to-last
+      prev = Number(closes[closes.length - 2]);
+      // If second-to-last bar equals regularMarketPrice, yesterday bar is at -1 or -2
+      if (Math.abs(prev - price) < 0.01 && closes.length >= 3) {
+        prev = Number(closes[closes.length - 3]);
+      }
+    } else {
+      prev = Number(meta.chartPreviousClose || meta.previousClose) || price;
+    }
+
+    let pre = meta.preMarketPrice ? Number(meta.preMarketPrice) : null;
+    let post = meta.postMarketPrice ? Number(meta.postMarketPrice) : null;
+
+    if (PENCE_SYMBOLS.includes(symbol)) {
+      price /= 100; prev /= 100;
+      if (pre) pre /= 100;
+      if (post) post /= 100;
+    }
+    if (!isFinite(price) || !isFinite(prev) || prev <= 0) return null;
+
+    // S3: Sanity-check extended-hours quotes. If >10% from regular, ignore.
+    if (pre != null && Math.abs(pre - price) / price > 0.10) pre = null;
+    if (post != null && Math.abs(post - price) / price > 0.10) post = null;
+
+    const eff = post || pre || price;
+    const changePct = prev ? ((eff - prev) / prev * 100) : 0;
+
+    // C1 guard: if computed changePct >25%, treat as suspect and return null
+    // (no Gulf War-style daily move in this universe)
+    if (Math.abs(changePct) > 25) return null;
+
+    return {
+      price: eff,
+      regular: price,
+      preMarket: pre,
+      postMarket: post,
+      prevClose: prev,
+      changePct: parseFloat(changePct.toFixed(2)),
+      currency: PENCE_SYMBOLS.includes(symbol) ? "GBP" : meta.currency,
+      marketState: meta.marketState,
+    };
+  } catch { return null; }
 }
 async function loadPrices(positions=[]) {
   const tickers={BRENT:"BZ=F",WTI:"CL=F",SPX:"^GSPC",VIX:"^VIX",GBPUSD:"GBPUSD=X"};
@@ -446,8 +517,13 @@ export async function POST(req) {
     if(!regexMatched&&userMsg.length>15){try{const rr=await callClaude(ROUTER_PROMPT,[{role:"user",content:userMsg}],false,200);const p=JSON.parse(rr.text.replace(/```json|```/g,"").trim());pathway=p.pathway||"general";if(Array.isArray(p.entities))entities=[...entities,...p.entities];urgency=p.urgency||"normal";contextNotes=p.context_notes||"";}catch(e){console.error("Router:",e.message);}}
     if(urgency==="CRITICAL")pathway="crisis";if(!PATHWAYS[pathway])pathway="general";await delay(200);
     const fc=formatContext(fundState,serverPrices,clientPrices,algoOutput);
-    let sp=BRAINSTEM+"\n\n"+AMYGDALA_PREAMBLE+"\n\n"+PATHWAYS[pathway];
-    if(["weekly_review","deep_analysis","investor_update"].includes(pathway)){const cs=getCortexSections(pathway,entities,contextNotes);if(cs.length)sp+="\n\n=== DEEP KNOWLEDGE ===\n"+cs.join("\n\n");}
+    // V5.0: Read peace signal + regime from KV to feed dynamic cortex and brainstem
+    const [peaceSignalData, regimeData] = await Promise.all([ kvGetLocal("apex:peace_signal"), kvGetLocal("apex:regime") ]);
+    const peaceSignal = peaceSignalData?.peace_signal || peaceSignalData || null;
+    const regime = regimeData?.current ? regimeData : (regimeData ? { current: regimeData } : null);
+    const brainstem = buildBrainstem(fundState, peaceSignal);
+    let sp=brainstem+"\n\n"+AMYGDALA_PREAMBLE+"\n\n"+PATHWAYS[pathway];
+    if(["weekly_review","deep_analysis","investor_update"].includes(pathway)){const cs=getCortexSections(pathway,entities,contextNotes,fundState,regime,peaceSignal);if(cs.length)sp+="\n\n=== DEEP KNOWLEDGE ===\n"+cs.join("\n\n");}
     sp+=fc;
     const ukNow=new Date().toLocaleDateString("en-GB",{weekday:"long",year:"numeric",month:"long",day:"numeric",timeZone:"Europe/London"})+" "+new Date().toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit",timeZone:"Europe/London"});
     const conflictDay=Math.floor((Date.now()-new Date("2026-02-28").getTime())/86400000);
