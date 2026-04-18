@@ -17,6 +17,9 @@ async function kvSet(key, value) {
 }
 
 // ═══ YAHOO DATA FETCH (daily + weekly + earnings) ═══
+// V5.0 FIX C1: changePct now computed from last two bars in closes array,
+// NOT from meta.chartPreviousClose (which returns YEAR-AGO close on range=1y).
+// V5.0 ADD: sanity check — reject any price move >20% as likely bad data.
 async function fetchYahooData(symbol) {
   try {
     const [dailyR, weeklyR, metaR] = await Promise.all([
@@ -32,7 +35,6 @@ async function fetchYahooData(symbol) {
     const isPence = PENCE_SYMBOLS.includes(symbol);
     const adj = isPence ? 100 : 1;
     const price = Number(meta.regularMarketPrice) / adj;
-    const prev = (Number(meta.chartPreviousClose || meta.previousClose) || meta.regularMarketPrice) / adj;
     if (!isFinite(price)) return { error: "bad price" };
 
     const rc = result?.indicators?.quote?.[0]?.close?.filter(c => c != null) || [];
@@ -44,6 +46,25 @@ async function fetchYahooData(symbol) {
     const highs = rh.map(c => c / adj);
     const lows = rl.map(c => c / adj);
     const opens = ro.map(c => c / adj);
+
+    // V5.0 FIX C1: true prevClose is the SECOND-TO-LAST bar in the closes array,
+    // NOT meta.chartPreviousClose (which is ~1 year ago on range=1y endpoint).
+    // Fallback to meta fields only if we have no bar history.
+    let prev;
+    if (closes.length >= 2) {
+      prev = closes[closes.length - 2];
+    } else {
+      prev = (Number(meta.previousClose) || Number(meta.chartPreviousClose) || Number(meta.regularMarketPrice)) / adj;
+    }
+    let changePct = prev ? ((price - prev) / prev * 100) : 0;
+
+    // V5.0 SANITY CHECK: reject absurd single-day moves as bad data.
+    // Real stocks rarely move >20% in a day; a >25% move is almost always a data error
+    // (split adjustment lag, weekend/holiday artifact, stale prev close).
+    // Flag the ticker as having bad data rather than propagating a phantom signal.
+    if (Math.abs(changePct) > 25) {
+      return { error: `suspect price data — ${changePct.toFixed(1)}% change flagged as likely bad data`, suspect_data: true };
+    }
 
     // ATR(14)
     let atr = 0;
@@ -109,7 +130,7 @@ async function fetchYahooData(symbol) {
     return {
       price: parseFloat(price.toFixed(4)),
       prevClose: parseFloat(prev.toFixed(4)),
-      changePct: prev ? parseFloat(((price - prev) / prev * 100).toFixed(2)) : 0,
+      changePct: parseFloat(changePct.toFixed(2)),
       currency: isPence ? "GBP" : meta.currency,
       atr: parseFloat(atr.toFixed(4)),
       sma20: sma20 ? parseFloat(sma20.toFixed(4)) : null,
@@ -168,8 +189,6 @@ function calcPositionSize(entry, stop, nav, gbpUsd, correlation) {
   let navExposure = (posValUsd / (gbpUsd || 1.28)) / nav * 100;
 
   // ═══ EXPOSURE CAP: max 25% NAV nominal per position ═══
-  // For tight-stop stocks at high prices, 1% risk can imply >25% nominal exposure.
-  // Cap to prevent over-concentration even if it means less than 1% risk.
   const MAX_EXPOSURE_PCT = 25;
   let exposureCapped = false;
   if (navExposure > MAX_EXPOSURE_PCT) {
@@ -178,7 +197,6 @@ function calcPositionSize(entry, stop, nav, gbpUsd, correlation) {
     units = Math.floor((maxPosValUsd / entry) * 100) / 100;
     posValUsd = entry * units;
     navExposure = MAX_EXPOSURE_PCT;
-    // Recompute actual risk with new units
     riskGbp = (units * riskPerShare) / (gbpUsd || 1.28);
     exposureCapped = true;
   }
@@ -215,7 +233,6 @@ function buildSetup(ticker, pd, scoreResult) {
     stop = Math.max(structStop, atrStop);
     if (entry - stop < atrSize * 0.8) stop = entry - (atrSize * 0.8);
     const risk = entry - stop;
-    // T1 = max of 3R or structural high50 (give room for breakouts above resistance)
     const minT1 = entry + risk * 3;
     t1 = high50 > minT1 ? high50 : minT1;
     t2 = entry + risk * 5;
@@ -250,8 +267,7 @@ function buildSetup(ticker, pd, scoreResult) {
   };
 }
 
-// ═══ CLAUDE JUDGE — AI IN THE LOOP ═══
-// For each A-grade or high-score candidate, ask Claude to evaluate.
+// ═══ CLAUDE JUDGE (Haiku 4.5) — AI IN THE LOOP ═══
 // Claude can: APPROVE, VETO (with reason), APPROVE_WITH_CAUTION (with note).
 async function claudeJudge(opportunity, regime, positions, peaceSignal) {
   const apiKey = process.env.ANTHROPIC_API_KEY;
@@ -277,7 +293,7 @@ PROPOSED SETUP:
 
 SIGNAL BREAKDOWN:
   Trend: ${sig.trend?.direction} (MTF aligned: ${sig.trend?.mtf_aligned})
-  RSI signal: ${sig.rsi?.direction} — ${sig.rsi?.reason || ""}
+  RSI signal: ${sig.rsi?.direction} - ${sig.rsi?.reason || ""}
   Volume: ${sig.volume?.signal}
   Range position: ${(sig.range?.pos * 100).toFixed(0)}% of 20d range
   Candle: ${sig.candle?.pattern || "none"}
@@ -292,13 +308,10 @@ MACRO CONTEXT:
 
 CURRENT BOOK: ${existing || "empty"}
 
-Respond ONLY with a JSON object, no other text:
-{
-  "verdict": "APPROVE" | "VETO" | "APPROVE_WITH_CAUTION",
-  "reason": "one sentence, max 150 chars",
-  "thesis": "one sentence thesis if APPROVE, why not if VETO, max 200 chars",
-  "entry_trigger": "specific condition to actually enter if APPROVE, else empty"
-}`;
+Respond with ONLY a JSON object and nothing else. No markdown code fences. No prose. Just the object:
+{"verdict": "APPROVE", "reason": "one sentence max 150 chars", "thesis": "one sentence max 200 chars", "entry_trigger": "specific condition to enter if APPROVE, empty string otherwise"}
+
+Verdict must be exactly one of: APPROVE, VETO, APPROVE_WITH_CAUTION.`;
 
   try {
     const r = await fetch("https://api.anthropic.com/v1/messages", {
@@ -315,14 +328,29 @@ Respond ONLY with a JSON object, no other text:
       }),
       signal: AbortSignal.timeout(15000),
     });
-    if (!r.ok) return { verdict: "error", reason: `HTTP ${r.status}` };
+    if (!r.ok) {
+      const errBody = await r.text().catch(() => "");
+      return { verdict: "error", reason: `HTTP ${r.status}`, raw: errBody.slice(0, 200) };
+    }
     const d = await r.json();
     const text = d.content?.[0]?.text || "";
-    // Parse JSON from Claude's response
-    const jsonMatch = text.match(/\{[\s\S]*\}/);
+
+    // V5.0 FIX: Strip markdown code fences that Haiku sometimes adds,
+    // then extract JSON object. Original regex would swallow fence chars.
+    let cleaned = text.trim();
+    // Remove leading code fence
+    cleaned = cleaned.replace(/^```(?:json)?\s*/i, "");
+    // Remove trailing code fence
+    cleaned = cleaned.replace(/\s*```\s*$/i, "");
+    // Extract first JSON object
+    const jsonMatch = cleaned.match(/\{[\s\S]*?\}(?=\s*$|\s*[^,\s\]\}])/) || cleaned.match(/\{[\s\S]*\}/);
     if (!jsonMatch) return { verdict: "error", reason: "No JSON in response", raw: text.slice(0, 200) };
     try {
       const parsed = JSON.parse(jsonMatch[0]);
+      // Validate: must have a recognized verdict
+      if (!parsed.verdict || !["APPROVE", "VETO", "APPROVE_WITH_CAUTION"].includes(parsed.verdict)) {
+        return { verdict: "error", reason: `Invalid verdict: ${parsed.verdict}`, raw: text.slice(0, 200) };
+      }
       return parsed;
     } catch (e) {
       return { verdict: "error", reason: "Parse failed: " + e.message, raw: text.slice(0, 200) };
@@ -349,22 +377,30 @@ export async function GET(req) {
     const dismissed = await kvGet("apex:dismissed") || { tickers: [], until: null };
     const dismissedActive = dismissed.until && new Date(dismissed.until).getTime() > Date.now() ? dismissed.tickers : [];
     const dismissedSet = new Set(dismissedActive);
+
+    // V5.0 FIX C2: regime route stores FLAT, not nested under `current`.
+    // Previous code read regimeData?.current?.primary_code (always undefined)
+    // and silently defaulted to REFLATION regardless of actual regime.
     const regimeData = await kvGet("apex:regime");
-    const regime = regimeData?.current?.primary_regime || "Rising Growth + Rising Inflation";
-    const regimeCode = regimeData?.current?.primary_code || "REFLATION";
-    const peaceSignal = state.signals || null;
+    const regime = regimeData?.primary_regime || regimeData?.current?.primary_regime || "Rising Growth + Rising Inflation";
+    const regimeCode = regimeData?.primary_code || regimeData?.current?.primary_code || "REFLATION";
+    const peaceSignal = (await kvGet("apex:peace_signal")) || state.signals || null;
 
     const tickersToScan = singleTicker ? [singleTicker.toUpperCase()] : SCAN_UNIVERSE.filter(t => !heldTickers.has(t) && !dismissedSet.has(t));
 
     // Fetch in batches with error tracking
     const priceData = {};
     const errors = {};
+    const suspectData = [];
     for (let i = 0; i < tickersToScan.length; i += 15) {
       const batch = tickersToScan.slice(i, i + 15);
       await Promise.all(batch.map(t => {
         const sym = WATCHLIST[t]?.yahoo || t;
         return fetchYahooData(sym).then(d => {
-          if (d?.error) errors[t] = d.error;
+          if (d?.error) {
+            errors[t] = d.error;
+            if (d.suspect_data) suspectData.push(t);
+          }
           else if (d) priceData[t] = d;
         });
       }));
@@ -382,11 +418,9 @@ export async function GET(req) {
       const pd = priceData[r.ticker];
       const setup = buildSetup(r.ticker, pd, r);
       const sizing = setup && !setup.blocked ? calcPositionSize(setup.entry, setup.stop, account.nav, gbpUsd, r.correlation) : null;
-      // Build enriched setup object with aliases for UI compatibility
       let enrichedSetup = null;
       if (setup) {
         enrichedSetup = { ...setup, ...sizing };
-        // UI-consumed alias fields (must match page.js renderer)
         enrichedSetup.quality_grade = r.grade;
         enrichedSetup.suggested_units = sizing?.units;
         enrichedSetup.position_value_gbp = sizing?.position_value_usd ? parseFloat((sizing.position_value_usd / gbpUsd).toFixed(2)) : null;
@@ -415,16 +449,17 @@ export async function GET(req) {
 
     let validOpps = withSetups.filter(o => o.valid).sort((a, b) => b.score - a.score);
 
-    // ═══ CLAUDE JUDGE for top candidates (only if not in single-ticker mode + not skipped) ═══
-    let aiJudgments = 0, aiVetoes = 0, aiCautions = 0;
+    // ═══ CLAUDE JUDGE for top candidates ═══
+    let aiJudgments = 0, aiVetoes = 0, aiCautions = 0, aiErrors = 0;
+    // V5.0 FIX S4: preserve VETOed setups separately for transparency.
+    // The user needs to see WHY Claude rejected a setup, not have it silently removed.
+    const vetoed = [];
     if (!singleTicker && !skipAI && validOpps.length > 0) {
-      // Only judge top 5 to limit cost; judge returns in parallel
       const toJudge = validOpps.slice(0, 5);
       const judgments = await Promise.all(toJudge.map(o => claudeJudge(o, regime, positions, peaceSignal)));
       for (let i = 0; i < toJudge.length; i++) {
         const j = judgments[i];
         toJudge[i].ai_judgment = j;
-        // Wire Claude's thesis into the setup so the UI displays it
         if (toJudge[i].setup) {
           toJudge[i].setup.thesis = j?.thesis || "";
           toJudge[i].setup.entry_trigger = j?.entry_trigger || "";
@@ -434,17 +469,32 @@ export async function GET(req) {
           aiVetoes++;
           toJudge[i].valid = false;
           toJudge[i].ai_vetoed = true;
+          // V5.0: capture a snapshot for the vetoed list
+          vetoed.push({
+            ticker: toJudge[i].ticker,
+            score: toJudge[i].score,
+            grade: toJudge[i].grade,
+            direction: toJudge[i].setup?.direction,
+            entry: toJudge[i].setup?.entry,
+            stop: toJudge[i].setup?.stop,
+            t1: toJudge[i].setup?.t1,
+            rr: toJudge[i].setup?.rr,
+            changePct: toJudge[i].changePct,
+            rsi: toJudge[i].rsi,
+            sector: toJudge[i].sector,
+            theme: toJudge[i].theme,
+            ai_judgment: j,
+          });
         }
         if (j?.verdict === "APPROVE_WITH_CAUTION") aiCautions++;
+        if (j?.verdict === "error" || j?.verdict === "no_ai") aiErrors++;
       }
-      // Re-filter after Claude's vetoes
       validOpps = withSetups.filter(o => o.valid).sort((a, b) => b.score - a.score);
     }
 
-    // Self-heal: if 0 valid setups, relax the SCORE threshold (not confidence — that was dead code)
+    // Self-heal: if 0 valid setups, relax the SCORE threshold
     let healing = null;
     if (validOpps.length === 0 && !singleTicker) {
-      // Lower bar: include score >= 50 (grade C) that pass R:R + correlation + not vetoed
       const relaxed = withSetups.filter(o =>
         o.score >= 50 &&
         o.confidence >= 0.20 &&
@@ -459,20 +509,26 @@ export async function GET(req) {
       }
     }
 
-    // Compute new_since_last list
     const newSinceLast = validOpps.filter(o => o.is_new).map(o => o.ticker);
 
     const payload = {
       scanned: Object.keys(priceData).length,
       universe_size: SCAN_UNIVERSE.length,
       fetch_errors: Object.keys(errors).length,
+      suspect_data_tickers: suspectData, // V5.0: list of tickers flagged for bad data
       error_detail: errors,
       dismissed_count: dismissedActive.length,
       blocked_earnings: withSetups.filter(o => o.setup?.blocked).length,
+      // V5.0 FIX C6: rename to match what server.js cron expects.
+      // Old field name was `actionable_raw` — cron reads `actionable` — never fired.
+      // Publishing BOTH so any existing consumer still works.
+      actionable: withSetups.filter(o => o.actionable).length,
       actionable_raw: withSetups.filter(o => o.actionable).length,
       ai_judgments: aiJudgments,
       ai_vetoes: aiVetoes,
       ai_cautions: aiCautions,
+      ai_errors: aiErrors,
+      vetoed, // V5.0: transparency — the VETO'd setups with Claude's reasoning
       passing_rr: validOpps.length,
       rejected_rr: withSetups.filter(o => o.actionable && o.setup && !o.setup.passes_rr_filter).length,
       rejected_confidence: withSetups.filter(o => o.score >= 65 && o.confidence < 0.25).length,
@@ -488,10 +544,12 @@ export async function GET(req) {
       timestamp: new Date().toISOString(),
     };
 
+    console.log(`[SCANNER] ${payload.scanned} scanned, ${payload.passing_rr} valid, ${aiVetoes} vetoed, ${newSinceLast.length} new, regime=${regimeCode}`);
+
     if (!singleTicker) {
       await kvSet("apex:last_scan", { ...payload, updated: payload.timestamp });
 
-      // Setup tracker (for backtesting calibration)
+      // Setup tracker (for hit-rate calibration)
       if (validOpps.length > 0) {
         let tracker = await kvGet("apex:setup_tracker") || { suggestions: [] };
         for (const opp of validOpps.slice(0, 10)) {
@@ -502,6 +560,16 @@ export async function GET(req) {
             ai_verdict: opp.ai_judgment?.verdict, ai_thesis: opp.ai_judgment?.thesis,
             suggested_at: payload.timestamp, regime: regimeCode,
             mtf_aligned: opp.signals?.trend?.mtf_aligned, outcome: null,
+            // V5.0 FIX C3 (part 1): persist the signal weights at entry time
+            // so adaptive learning has REAL data to work with when the trade closes.
+            signals_at_entry: {
+              momentum: opp.signals?.momentum?.score || 0,
+              trend_following: opp.signals?.trend?.score || 0,
+              rsi_signal: opp.signals?.rsi?.strength || 0,
+              volume_breakout: opp.signals?.volume?.signal === "BREAKOUT" ? 1 : 0,
+              range_position: opp.signals?.range?.score || 0,
+              regime_fit: opp.regime_multiplier || 1,
+            },
           });
         }
         if (tracker.suggestions.length > 500) tracker.suggestions = tracker.suggestions.slice(-500);
