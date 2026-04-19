@@ -201,12 +201,77 @@ cron.schedule("0 2 * * *", async () => {
   }
 }, { timezone: "Europe/London" });
 
+// V5.2 CRON 14: DAILY REVIEW NUDGE (R10)
+// If no morning brief read in 24h, nudge at 09:30.
+cron.schedule("30 9 * * 1-5", async () => {
+  const log = await callAPI("/api/state");
+  const strategyLog = log?.state?.strategy_log || [];
+  const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
+  const recentMorningBrief = strategyLog.some(e =>
+    (e.note || "").toLowerCase().includes("morning") && new Date(e.date).getTime() > oneDayAgo
+  );
+  if (!recentMorningBrief) {
+    await tg("⏰ *DAILY REVIEW REMINDER (R10)*\n\nOperating Bible: every position reviewed daily.\n\nNo morning brief detected in last 24h. Open APEX and type: _morning brief_");
+  }
+}, { timezone: "Europe/London" });
+
+// V5.2 CRON 15: CORRELATION AUDIT (R7) — runs nightly
+// Detects positions sharing sector + direction + kill switch
+cron.schedule("0 22 * * 0-6", async () => {
+  const log = await callAPI("/api/state");
+  const positions = log?.state?.positions || [];
+  if (positions.length < 2) return;
+
+  const correlations = [];
+  for (let i = 0; i < positions.length; i++) {
+    for (let j = i + 1; j < positions.length; j++) {
+      const a = positions[i], b = positions[j];
+      const aSector = (a.sector || "").toLowerCase();
+      const bSector = (b.sector || "").toLowerCase();
+      const aDir = (a.direction || "buy").toLowerCase();
+      const bDir = (b.direction || "buy").toLowerCase();
+      const aKill = (a.kill_switch || "").toLowerCase();
+      const bKill = (b.kill_switch || "").toLowerCase();
+      const sectorMatch = aSector && bSector && aSector === bSector;
+      const dirMatch = aDir === bDir;
+      const killMatch = aKill && bKill && (aKill.includes(bKill) || bKill.includes(aKill));
+      if (sectorMatch && dirMatch && killMatch) {
+        correlations.push(`${a.id} <-> ${b.id} (sector=${aSector}, kill overlap)`);
+      }
+    }
+  }
+
+  if (correlations.length > 0) {
+    await tg(`🔗 *R7 CORRELATION AUDIT*\n\n${correlations.length} correlated pair(s) detected:\n\n${correlations.map(c => "• " + c).join("\n")}\n\nLTCM lesson: correlated positions become ONE position in crisis. Review sleeve exposure.`);
+  }
+}, { timezone: "Europe/London" });
+
+// V5.2 CRON 16: DRAWDOWN MONITOR — fires once on crossing 15% or 20%, resets on recovery below 10%
+cron.schedule("*/30 8-21 * * 1-5", async () => {
+  const r = await callAPI("/api/rules");
+  if (!r) return;
+  const dd = Number(r.drawdown_pct) || 0;
+  const stateResp = await callAPI("/api/state");
+  const prev = Number(stateResp?.state?.account?.last_alerted_drawdown) || 0;
+
+  if (dd >= 20 && prev < 20) {
+    await tg(`🚨 *R4 HALT TRIGGERED*\n\nDrawdown: ${dd.toFixed(2)}%\n\nPer Operating Bible: reduce all positions to 50% and halt new entries. Full portfolio review required.`);
+    await callAPI("/api/state", "POST", { action: "sync_account", actor: "system", reason: "R4 halt threshold crossed", last_alerted_drawdown: 20 });
+  } else if (dd >= 15 && prev < 15) {
+    await tg(`⚠️ *R4 WARNING*\n\nDrawdown: ${dd.toFixed(2)}%\n\nApproaching 20% halt threshold. Consider tightening stops or reducing risk.`);
+    await callAPI("/api/state", "POST", { action: "sync_account", actor: "system", reason: "R4 warning threshold crossed", last_alerted_drawdown: 15 });
+  } else if (dd < 10 && prev > 0) {
+    // Recovery: reset alert state so crossing again fires a new alert
+    await callAPI("/api/state", "POST", { action: "sync_account", actor: "system", reason: "Drawdown recovered below 10%", last_alerted_drawdown: 0 });
+  }
+}, { timezone: "Europe/London" });
+
 // START
 app.prepare().then(() => {
   createServer((req, res) => { handle(req, res, parse(req.url, true)); }).listen(port, "0.0.0.0", () => {
-    console.log(`\n🧠 APEX BRAIN V5.0 on port ${port} | ${dev ? "dev" : "production"} | TG: ${TG_TOKEN ? "YES" : "NO"} | 13 crons\n`);
+    console.log(`\n🧠 APEX BRAIN V5.2 on port ${port} | ${dev ? "dev" : "production"} | TG: ${TG_TOKEN ? "YES" : "NO"} | 16 crons\n`);
     if (TG_TOKEN && TG_CHAT) {
-      tg("🧠 *APEX V5.0 STARTED*\n\n*Critical fixes deployed:*\n• changePct bug (no more phantom moves)\n• Regime detection wired correctly\n• Adaptive learning fed from real trades\n• Peace signal framework FUNCTIONAL\n• Scanner Telegram alerts now fire\n• Health check KV keys corrected\n• Vetoed setups preserved for audit\n\n13 crons active. Type /help for commands.");
+      tg("🧠 *APEX V5.2 STARTED*\n\n*Institutional-grade upgrades:*\n• Operating Bible rule enforcement at entry\n• Fund-level drawdown halt at 20% (R4)\n• Monthly loss tracker (R3)\n• Full audit trail of every state mutation\n• Correlation audit (R7 nightly)\n• Daily review nudge (R10)\n• Trailing stops: market-state aware, split detection\n• Race-condition-safe state writes\n\n16 crons active. Type /help for commands.");
     }
     try {
       const { startTelegramPolling } = require("./telegramPoll.js");
