@@ -1,5 +1,9 @@
-// APEX BRAIN V5.0 — CORTEX (Layer 3)
+// APEX BRAIN V5.2 — CORTEX (Layer 3)
 // DYNAMIC sections — reads live state instead of hardcoded stale facts.
+//
+// V5.2 ADDS: rule_status section — surfaces current Operating Bible rule state
+//   (drawdown, monthly P&L, position count, halt status) so Claude sees real
+//   fund-level risk, not just stale assumptions.
 //
 // V5.0 FIX: Previous version hardcoded "Peace Signal 1/8 COLLAPSED",
 // "blockade active since 13 April 2026", and pipeline slot assignments.
@@ -231,10 +235,51 @@ const ENTITY_SECTIONS = {
 
 // Pathway-to-section mapping
 const PATHWAY_SECTIONS = {
-  weekly_review: ["regime", "reflexivity", "psychology", "pipeline", "conflict"],
-  deep_analysis: ["masters", "regime", "reflexivity", "technical", "tail_risk"],
-  investor_update: ["regime", "pipeline", "earnings", "conflict"],
+  weekly_review: ["regime", "reflexivity", "psychology", "pipeline", "conflict", "rule_status"],
+  deep_analysis: ["masters", "regime", "reflexivity", "technical", "tail_risk", "rule_status"],
+  investor_update: ["regime", "pipeline", "earnings", "conflict", "rule_status"],
 };
+
+// V5.2: Build rule_status section from live state
+function buildRuleStatusSection(state) {
+  if (!state) return "RULE STATUS: (state unavailable)";
+
+  const nav = Number(state?.account?.nav) || 0;
+  const hwm = Number(state?.account?.high_water_mark) || nav;
+  const dd = hwm > 0 ? Math.max(0, ((hwm - nav) / hwm) * 100) : 0;
+
+  const monthStart = Number(state?.account?.month_start_nav) || 0;
+  const monthlyPct = monthStart > 0 ? ((nav - monthStart) / monthStart) * 100 : null;
+
+  const posCount = (state.positions || []).length;
+  const realised = Number(state?.account?.total_realised_pl) || 0;
+
+  let riskLevel = "NORMAL";
+  const flags = [];
+
+  if (dd >= 20) { riskLevel = "HALT"; flags.push(`R4 HALT: ${dd.toFixed(2)}% drawdown — new positions BLOCKED`); }
+  else if (dd >= 15) { riskLevel = "ELEVATED"; flags.push(`R4 WARNING: ${dd.toFixed(2)}% drawdown, approaching 20% halt`); }
+
+  if (monthlyPct !== null && monthlyPct < -10) {
+    if (riskLevel === "NORMAL") riskLevel = "ELEVATED";
+    flags.push(`R3: Monthly P&L ${monthlyPct.toFixed(2)}% — new positions should be suspended until month rolls`);
+  }
+
+  if (posCount >= 10) { flags.push(`POSITION CAP: ${posCount}/10 — no new positions allowed`); }
+  else if (posCount >= 8) { flags.push(`Position count: ${posCount}/10 — approaching cap`); }
+
+  const lines = [`RULE STATUS: ${riskLevel}`];
+  lines.push(`NAV £${nav.toFixed(2)} | HWM £${hwm.toFixed(2)} | Drawdown ${dd.toFixed(2)}%`);
+  if (monthlyPct !== null) lines.push(`Monthly P&L: ${monthlyPct >= 0 ? "+" : ""}${monthlyPct.toFixed(2)}% (from £${monthStart.toFixed(2)} month start)`);
+  lines.push(`Positions: ${posCount}/10 | Realised P&L all-time: ${realised >= 0 ? "+" : ""}£${realised.toFixed(2)}`);
+  if (flags.length > 0) {
+    lines.push(`FLAGS:`);
+    flags.forEach(f => lines.push(`  - ${f}`));
+  } else {
+    lines.push(`No rule flags. Fund operating within all Operating Bible thresholds.`);
+  }
+  return lines.join("\n");
+}
 
 export function getCortexSections(pathway, entities = [], contextNotes = "", state = null, regime = null, peaceSignal = null) {
   const needed = new Set(PATHWAY_SECTIONS[pathway] || []);
@@ -251,17 +296,23 @@ export function getCortexSections(pathway, entities = [], contextNotes = "", sta
   if (cn.includes("regime") || cn.includes("macro")) needed.add("regime");
   if (cn.includes("reflexiv") || cn.includes("soros") || cn.includes("loop")) needed.add("reflexivity");
   if (cn.includes("pipeline") || cn.includes("slot") || cn.includes("candidate")) needed.add("pipeline");
+  if (cn.includes("drawdown") || cn.includes("rule") || cn.includes("halt") || cn.includes("risk")) needed.add("rule_status");
+
+  // V5.2: ALWAYS include rule_status for fund-level pathways so Claude knows
+  // if the fund is in HALT mode before giving any trade advice
+  if (pathway && ["weekly_review", "deep_analysis", "investor_update"].includes(pathway)) {
+    needed.add("rule_status");
+  }
 
   const output = [];
   for (const key of needed) {
-    // Static first
     if (STATIC_SECTIONS[key]) { output.push(STATIC_SECTIONS[key]); continue; }
-    // Dynamic builders
     if (key === "regime") { output.push(buildRegimeSection(regime)); continue; }
     if (key === "conflict") { output.push(buildConflictSection(peaceSignal, state)); continue; }
     if (key === "reflexivity") { output.push(buildReflexivitySection(regime, peaceSignal)); continue; }
     if (key === "earnings") { output.push(buildEarningsSection(state)); continue; }
     if (key === "pipeline") { output.push(buildPipelineSection(state)); continue; }
+    if (key === "rule_status") { output.push(buildRuleStatusSection(state)); continue; }
   }
   return output;
 }
