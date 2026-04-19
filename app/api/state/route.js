@@ -1,13 +1,19 @@
-// APEX BRAIN V5.1 — STATE ROUTE
-// V5.0: C3 adaptive learning wiring, costModel on close
-// V5.1: trailing_stop_pct and trailing_stop_hwm fields in update_position,
-//       disabling trailing clears all related fields.
+// APEX BRAIN V5.2 — STATE ROUTE
+// V5.0: adaptive learning wiring, costModel on close
+// V5.1: trailing_stop_mode/distance/pct/hwm fields in update_position
+// V5.2: Operating Bible rule enforcement at entry (R1/R2/R3/R4/R6/R7, 10-position cap,
+//       stop-on-correct-side, mandatory thesis + kill switch). Warn+confirm via
+//       body.confirm_overrides (array of rule codes). Full audit trail.
+//       Drawdown circuit breaker halts new positions at 20% DD from HWM.
+//       Monthly P&L tracking requires month_start_nav rollover (handled in sync_account).
 
 import { NextResponse } from "next/server";
 import { DEFAULT_STATE } from "../../data/fundState.js";
 import { WATCHLIST } from "../../data/algoConfig.js";
 import { initLearningState, recordOutcome } from "../../lib/adaptiveLearning.js";
 import { calculateTradeCosts } from "../../lib/costModel.js";
+import { validateNewPosition, validateUpdate, classify, fundRuleStatus, SEVERITY } from "../../lib/ruleEngine.js";
+import { auditWrite, computeDelta } from "../../lib/auditLog.js";
 
 export const maxDuration = 30;
 
@@ -155,10 +161,70 @@ export async function POST(req) {
         if (body.margin != null) state.account.margin_used = Number(body.margin);
         if (body.health != null) state.account.margin_health_pct = Number(body.health);
         if (body.gbp_usd != null) state.account.gbp_usd = Number(body.gbp_usd);
+        // V5.2: System-writable fields (cron 16 uses these for deduplication)
+        if (body.last_alerted_drawdown != null) state.account.last_alerted_drawdown = Number(body.last_alerted_drawdown);
         state.account.last_updated = new Date().toISOString();
         if (state.account.nav > (state.account.high_water_mark || 0)) state.account.high_water_mark = state.account.nav;
+
+        // V5.2: Monthly rollover tracker — set month_start_nav on first sync of new month
+        const now = new Date();
+        const thisMonth = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`;
+        if (state.account.last_month_tracked !== thisMonth) {
+          state.account.month_start_nav = Number(state.account.nav) || 0;
+          state.account.last_month_tracked = thisMonth;
+          await logStrategy(state, `📅 Month rollover: ${thisMonth}, month_start_nav = £${state.account.month_start_nav.toFixed(2)}`);
+          await auditWrite({
+            actor: "system", action: "month_rollover", entity: "fund",
+            after: { month: thisMonth, month_start_nav: state.account.month_start_nav },
+            reason: `New month started`,
+          });
+        }
+
+        // V5.2: audit significant NAV changes
+        if (body.nav != null && body.reason) {
+          await auditWrite({
+            actor: body.actor || "user", action: "nav_sync", entity: "fund",
+            after: { nav: state.account.nav, cash: state.account.cash },
+            reason: body.reason,
+          });
+        }
+
         const ok = await kvSet("apex:state", state);
         return NextResponse.json({ ok, action: "sync_account", account: state.account });
+      }
+
+      case "get_rule_status": {
+        // V5.2: expose current fund-level rule status
+        return NextResponse.json({ ok: true, rule_status: fundRuleStatus(state) });
+      }
+
+      case "preview_add_position": {
+        // V5.2: dry-run rule validation without committing
+        const v = validateTicker(body.ticker || body.id);
+        if (!v.valid) return NextResponse.json({ error: v.error }, { status: 400 });
+        const existing = (state.positions || []).findIndex(p => p.id === v.ticker);
+        if (existing >= 0) return NextResponse.json({ error: `${v.ticker} already exists.` }, { status: 400 });
+
+        const pos = {
+          id: v.ticker,
+          direction: (body.direction || "buy").toLowerCase(),
+          units: Number(body.units) || 0, entry_price: Number(body.entry_price) || 0,
+          currency: body.currency || "USD",
+          stop: body.stop != null ? Number(body.stop) : null,
+          t1: body.t1 != null ? Number(body.t1) : null, t2: body.t2 != null ? Number(body.t2) : null,
+          kill_switch: body.kill_switch || "", thesis: body.thesis || "",
+          sector: body.sector || WATCHLIST[v.ticker]?.sector || "",
+        };
+
+        const violations = validateNewPosition(pos, state);
+        const { blockers, warnings, infos } = classify(violations);
+        return NextResponse.json({
+          ok: true, action: "preview_add_position",
+          blocked: blockers.length > 0,
+          blockers, warnings, infos,
+          requires_confirmation: warnings.length > 0,
+          rule_status: fundRuleStatus(state),
+        });
       }
 
       case "add_position": {
@@ -168,6 +234,7 @@ export async function POST(req) {
         const existing = (state.positions || []).findIndex(p => p.id === v.ticker);
         if (existing >= 0) return NextResponse.json({ error: `${v.ticker} already exists. Close first or use update_position.` }, { status: 400 });
 
+        // Build proposed position
         const pos = {
           id: v.ticker, name: body.name || WATCHLIST[v.ticker]?.name || v.ticker,
           sleeve: body.sleeve || "B", direction: (body.direction || "buy").toLowerCase(),
@@ -177,17 +244,67 @@ export async function POST(req) {
           t1: body.t1 != null ? Number(body.t1) : null, t2: body.t2 != null ? Number(body.t2) : null,
           kill_switch: body.kill_switch || "", peace_action: body.peace_action || "",
           thesis: body.thesis || "", conviction: Number(body.conviction) || 3, notes: body.notes || "",
-          // V5.0: if opening from promote_to_active, preserve signals_at_entry for learning
+          sector: body.sector || WATCHLIST[v.ticker]?.sector || "",
           signals_at_entry: body.signals_at_entry || null,
         };
+
+        // V5.2: Operating Bible rule enforcement
+        const violations = validateNewPosition(pos, state);
+        const { blockers, warnings } = classify(violations);
+        const confirmedOverrides = Array.isArray(body.confirm_overrides) ? body.confirm_overrides : [];
+
+        // Blockers cannot be overridden via confirm_overrides (R1 stop missing, stop side, R4 halt, 10-cap)
+        if (blockers.length > 0) {
+          return NextResponse.json({
+            error: "RULE BLOCK",
+            violations: blockers,
+            warnings,
+            blocked: true,
+            message: `Cannot open position: ${blockers.map(b => b.rule).join(", ")}. Blocked rules cannot be overridden.`,
+          }, { status: 422 });
+        }
+
+        // Warnings can be overridden IF user explicitly confirms each one
+        const unacknowledgedWarnings = warnings.filter(w => !confirmedOverrides.includes(w.rule));
+        if (unacknowledgedWarnings.length > 0) {
+          return NextResponse.json({
+            error: "RULE WARNING",
+            violations: unacknowledgedWarnings,
+            warnings: unacknowledgedWarnings,
+            requires_confirmation: true,
+            message: `${unacknowledgedWarnings.length} warnings must be acknowledged. Resubmit with confirm_overrides: [${unacknowledgedWarnings.map(w => `"${w.rule}"`).join(", ")}]`,
+          }, { status: 409 });
+        }
+
+        // All clear (or overrides accepted)
         if (!state.positions) state.positions = [];
         state.positions.push(pos);
         state.account.last_updated = new Date().toISOString();
 
-        await logStrategy(state, `OPENED ${v.ticker} ${pos.direction.toUpperCase()} ${pos.units}u @ $${pos.entry_price} [${pos.sleeve}] — ${pos.thesis || "no thesis"}`);
+        const warningsApplied = warnings.length > 0;
+        const logNote = `OPENED ${v.ticker} ${pos.direction.toUpperCase()} ${pos.units}u @ $${pos.entry_price} [${pos.sleeve}] — ${pos.thesis || "no thesis"}` + (warningsApplied ? ` [OVERRIDES: ${confirmedOverrides.join(",")}]` : "");
+        await logStrategy(state, logNote);
+
+        // Audit log
+        await auditWrite({
+          actor: "user",
+          action: "open_position",
+          entity: pos.id,
+          after: { entry_price: pos.entry_price, stop: pos.stop, t1: pos.t1, t2: pos.t2, units: pos.units, direction: pos.direction, sleeve: pos.sleeve, thesis: pos.thesis, kill_switch: pos.kill_switch },
+          reason: body.reason || `Opened ${pos.id} ${pos.direction.toUpperCase()}`,
+          meta: {
+            rule_overrides: warningsApplied ? confirmedOverrides : null,
+            warnings_issued: warnings.map(w => w.rule),
+            rr: pos.t1 && pos.stop ? ((Math.abs(pos.t1 - pos.entry_price) / Math.abs(pos.entry_price - pos.stop)).toFixed(2)) : null,
+          },
+        });
 
         const ok = await kvSet("apex:state", state);
-        return NextResponse.json({ ok, action: "add_position", position: pos, warning: v.unknown ? `${v.ticker} not in watchlist` : undefined });
+        return NextResponse.json({
+          ok, action: "add_position", position: pos,
+          warning: v.unknown ? `${v.ticker} not in watchlist` : undefined,
+          overrides_applied: warningsApplied ? confirmedOverrides : undefined,
+        });
       }
 
       case "update_position": {
@@ -196,7 +313,28 @@ export async function POST(req) {
         if (idx < 0) return NextResponse.json({ error: `${ticker} not found` }, { status: 404 });
 
         const pos = state.positions[idx];
+        // V5.2: capture before snapshot for audit log + rule validation
+        const beforeSnapshot = JSON.parse(JSON.stringify(pos));
         const changes = [];
+
+        // V5.2: R5 check — adding to losing position
+        if (body.units !== undefined && Number(body.units) > Number(pos.units)) {
+          const livePrice = body.live_price != null ? Number(body.live_price) : null;
+          const updateViolations = validateUpdate({ units: Number(body.units) }, pos, state, livePrice);
+          const { blockers, warnings } = classify(updateViolations);
+          const confirmedOverrides = Array.isArray(body.confirm_overrides) ? body.confirm_overrides : [];
+
+          if (blockers.length > 0) {
+            return NextResponse.json({ error: "RULE BLOCK", violations: blockers, blocked: true }, { status: 422 });
+          }
+          const unack = warnings.filter(w => !confirmedOverrides.includes(w.rule));
+          if (unack.length > 0) {
+            return NextResponse.json({
+              error: "RULE WARNING", violations: unack, requires_confirmation: true,
+              message: `Resubmit with confirm_overrides: [${unack.map(w => `"${w.rule}"`).join(", ")}]`,
+            }, { status: 409 });
+          }
+        }
 
         if (body.stop !== undefined) {
           const newStop = Number(body.stop);
@@ -287,6 +425,21 @@ export async function POST(req) {
 
         if (changes.length) await logStrategy(state, `UPDATED ${ticker}: ${changes.join(", ")}`);
 
+        // V5.2: audit log
+        if (changes.length) {
+          const delta = computeDelta(beforeSnapshot, pos);
+          if (delta) {
+            await auditWrite({
+              actor: "user",
+              action: "edit_position",
+              entity: ticker,
+              before: delta.before, after: delta.after,
+              reason: body.reason || changes.join(", "),
+              meta: { changes },
+            });
+          }
+        }
+
         const ok = await kvSet("apex:state", state);
         return NextResponse.json({ ok, action: "update_position", ticker, changes, position: pos });
       }
@@ -358,6 +511,15 @@ export async function POST(req) {
         // V5.0 FIX C3: feed adaptive learning with REAL signals (not synthetic)
         const learningResult = await feedLearningFromClose(ticker, pos.entry_price, exitPrice, pos.units, pos.direction);
 
+        // V5.2: audit log
+        await auditWrite({
+          actor: "user", action: "close_position", entity: ticker,
+          before: { entry_price: pos.entry_price, units: pos.units, stop: pos.stop },
+          after: { exit_price: exitPrice, net_pl_gbp: Math.round(plGbp * 100) / 100 },
+          reason: body.reason || "Manual close",
+          meta: { exit_type: body.exit_type || "manual", gross_pl: Math.round(plGbpGross * 100) / 100, costs: costBreakdown },
+        });
+
         const ok = await kvSet("apex:state", state);
         return NextResponse.json({ ok, action: "close_position", closed, learning: learningResult });
       }
@@ -420,6 +582,14 @@ export async function POST(req) {
         // Note: partial closes do NOT feed adaptive learning (only final close does)
         // to avoid over-weighting trades that close in multiple stages.
 
+        // V5.2: audit
+        await auditWrite({
+          actor: "user", action: "partial_close", entity: ticker,
+          before: { units: pos.units }, after: { units: state.positions[idx].units, exit_price: exitPrice, closed_units: closeUnits, net_pl_gbp: plGbp },
+          reason: body.reason || "Partial close",
+          meta: { exit_type: "partial", gross_pl: Math.round(plGbpGross * 100) / 100, costs: costBreakdown },
+        });
+
         const ok = await kvSet("apex:state", state);
         return NextResponse.json({ ok, action: "partial_close", closed, remaining: state.positions[idx].units });
       }
@@ -436,6 +606,13 @@ export async function POST(req) {
         state.positions[idx].stop = newStop;
         if (body.trailing) state.positions[idx].trailing_stop = newStop;
         state.account.last_updated = new Date().toISOString();
+        // V5.2: audit
+        await auditWrite({
+          actor: body.actor || "user", action: "move_stop", entity: ticker,
+          before: { stop: oldStop }, after: { stop: newStop },
+          reason: body.reason || `Stop moved ${dir === "buy" ? "up" : "down"} from $${oldStop} to $${newStop}`,
+          meta: { direction: dir, trailing: !!body.trailing },
+        });
         const ok = await kvSet("apex:state", state);
         return NextResponse.json({ ok, action: "move_stop", ticker, old_stop: oldStop, new_stop: newStop });
       }
@@ -454,12 +631,19 @@ export async function POST(req) {
         const amount = Number(body.amount);
         if (!amount || amount <= 0) return NextResponse.json({ error: "Invalid amount" }, { status: 400 });
         if (!state.deposits) state.deposits = [];
+        const prevNav = state.account.nav || 0;
         state.deposits.push({ date: body.date || new Date().toISOString().slice(0, 10), amount });
         state.account.total_deposited = (state.account.total_deposited || 0) + amount;
         state.account.cash = (state.account.cash || 0) + amount;
         state.account.nav = (state.account.nav || 0) + amount;
         state.account.last_updated = new Date().toISOString();
         await logStrategy(state, `DEPOSIT £${amount} — NAV now £${state.account.nav.toFixed(2)}`);
+        // V5.2: audit
+        await auditWrite({
+          actor: "user", action: "deposit", entity: "fund",
+          before: { nav: prevNav }, after: { nav: state.account.nav, deposit_amount: amount },
+          reason: body.reason || `Deposit £${amount}`,
+        });
         const ok = await kvSet("apex:state", state);
         return NextResponse.json({ ok, action: "add_deposit", new_nav: state.account.nav });
       }
