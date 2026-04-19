@@ -1,15 +1,18 @@
-// APEX BRAIN V5.1 — ALGO INLINE (Tiers 1-3)
+// APEX BRAIN V5.2 — ALGO INLINE (Tiers 1-3)
 // Runs inline with chat route. Provides real-time risk screens + signals.
 //
-// V5.1 CHANGES:
-// - S1 is trailing-stop-aware: when pos.trailing_stop is set, STOP_WARN/CRITICAL
+// V5.2 CHANGES:
+// - S1 ex-dividend awareness: if a position has ex_div_date == today, stop
+//   alerts for that ticker are suppressed (prevents false breach on div drop)
+// - S1 split detection: if position has possible_split flag in recent scans,
+//   emit SPLIT_WARN yellow alert instead of red STOP alerts
+// - Currency-aware display ($ for USD, £ for pence tickers)
+//
+// V5.1: S1 trailing-stop-aware: when pos.trailing_stop is set, STOP_WARN/CRITICAL
 //   alerts are suppressed and replaced with a green TRAILING_ACTIVE info line.
 //   TRAILING_STOP_BREACHED (RED) fires if live price crosses the trailing stop.
 //
-// V5.0 FIX (S2): Import canonical SECTOR_MAP from scannerAdvanced.js instead of
-// hardcoded 25-ticker subset. Previous version's correlation audit was wrong for
-// anything outside the subset (e.g. FCX, OXY, EOG, SLV, GDX, VNQ, XLU correctly
-// had sectors but algoInline returned "Other" for them).
+// V5.0 FIX (S2): Import canonical SECTOR_MAP from scannerAdvanced.js
 
 import { ALGO_THRESHOLDS } from "../data/algoConfig.js";
 import { SECTOR_MAP as CANONICAL_SECTOR_MAP, THEME_MAP } from "./scannerAdvanced.js";
@@ -57,14 +60,33 @@ function runScreens(positions, prices, account) {
     const entry = Number(pos.entry_price);
     const units = Number(pos.units);
 
-    // S1: Stop proximity — V5.1: trailing-stop-aware
-    // If position has trailing_stop, use it as the effective stop.
-    // Regular STOP_WARN/STOP_CRITICAL suppressed in favor of TRAILING_ACTIVE info line.
-    // BUT if trailing stop is breached, fire RED TRAILING_STOP_BREACHED.
+    // S1: Stop proximity — V5.2: ex-div + split aware, trailing-stop aware
+    // V5.2 NEW: ex-dividend detection — if pos.ex_div_date is today, suppress stop alerts
+    //   (dividend drops cause false breaches. APD pays $1.81 on April 1, drops from $285→$283.19)
+    // V5.2 NEW: possible_split flag detected by worker — we emit SPLIT_WARN yellow, NOT stop alerts
     const hasTrailing = pos.trailing_stop != null && Number.isFinite(Number(pos.trailing_stop));
     const effectiveStop = hasTrailing ? Number(pos.trailing_stop) : pos.stop;
 
-    if (effectiveStop) {
+    // Ex-dividend today?
+    const todayStr = new Date().toISOString().slice(0, 10);
+    const isExDivToday = pos.ex_div_date && pos.ex_div_date.slice(0, 10) === todayStr;
+
+    // Split flag?
+    const hasSplitFlag = pos.possible_split === true;
+
+    if (isExDivToday) {
+      screens.push({
+        ticker: pos.id, screen: "EX_DIV_TODAY", level: "INFO",
+        detail: `💰 ${pos.id}: ex-dividend today (${pos.ex_div_amount ? `$${pos.ex_div_amount}/share` : ""}). Price drop expected — stop alerts suppressed.`,
+        value: 0,
+      });
+    } else if (hasSplitFlag) {
+      screens.push({
+        ticker: pos.id, screen: "SPLIT_WARN", level: "AMBER",
+        detail: `⚠️  ${pos.id}: possible stock split detected. Review HWM/stop values manually.`,
+        value: 0,
+      });
+    } else if (effectiveStop) {
       const sd = stopDistPct(lp, effectiveStop, dir);
 
       if (hasTrailing) {
@@ -82,7 +104,6 @@ function runScreens(positions, prices, account) {
           // Active trailing — informational green, no warning levels
           const mode = pos.trailing_stop_mode || (pos.trailing_stop_distance != null ? "distance" : pos.trailing_stop_pct != null ? "pct" : null);
           const curr = pos.currency === "GBP" ? "£" : "$";
-          // Show both distance and pct in the info line
           let modeStr = "";
           if (mode === "distance" && pos.trailing_stop_distance != null) {
             const effPct = pos.trailing_stop_hwm > 0 ? ((pos.trailing_stop_hwm - effectiveStop) / pos.trailing_stop_hwm * 100).toFixed(1) : null;
@@ -103,11 +124,12 @@ function runScreens(positions, prices, account) {
           });
         }
       } else {
-        // Regular stop — original warning logic
+        // Regular stop — original warning logic, currency aware
+        const curr = pos.currency === "GBP" ? "£" : "$";
         if (sd !== null && sd < T.stop_proximity_critical) {
-          screens.push({ ticker: pos.id, screen: "STOP_CRITICAL", level: "RED", detail: `${$(sd, 1)}% from stop ($${pos.stop})`, value: sd });
+          screens.push({ ticker: pos.id, screen: "STOP_CRITICAL", level: "RED", detail: `${$(sd, 1)}% from stop (${curr}${pos.stop})`, value: sd });
         } else if (sd !== null && sd < T.stop_proximity_warn) {
-          screens.push({ ticker: pos.id, screen: "STOP_WARN", level: "AMBER", detail: `${$(sd, 1)}% from stop ($${pos.stop})`, value: sd });
+          screens.push({ ticker: pos.id, screen: "STOP_WARN", level: "AMBER", detail: `${$(sd, 1)}% from stop (${curr}${pos.stop})`, value: sd });
         }
       }
     }
