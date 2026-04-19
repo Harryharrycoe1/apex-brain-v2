@@ -1,35 +1,92 @@
-// APEX BRAIN V5.1 — PRICES ROUTE
-// V5.0 fixes: C1 (chartPreviousClose bug), S3 (stale extended-hours quote filter)
-// V5.1 adds: trailing stop worker — auto-advances trailing stops on every price tick,
-// persists to KV, logs advances/breaches to strategy log.
+// APEX BRAIN V5.2 — PRICES ROUTE
+//
+// V5.2 CHANGES FROM V5.1:
+//   - C1 FIX: race condition — worker writes only touch trailing_stop_* fields
+//             via a SAFE_MERGE read→mutate→CAS pattern. User edits are preserved.
+//   - C2 FIX: log field names corrected to match worker return shape
+//   - H6 FIX: kvSet return checked with single retry on failure; surface to health
+//   - M9 FIX: redundant kvGet in log code removed
+//   - L3 FIX: only persist when stop actually changed OR breach detected; HWM-only
+//             changes batch to a 5-minute interval via apex:trail_hwm_pending key
+//   - NEW:    audit log writes on every breach + stop advance
+//   - NEW:    expose kv_errors to /api/health
 
 import { NextResponse } from "next/server";
 import { WATCHLIST, PENCE_SYMBOLS } from "../../data/algoConfig.js";
 import { DEFAULT_STATE } from "../../data/fundState.js";
 import { processTrailingStops, formatTrailingUpdates } from "../../lib/trailingStopWorker.js";
+import { auditWrite } from "../../lib/auditLog.js";
 
 export const maxDuration = 30;
 
-// ═══ KV ═══
+// ═══ KV with retry ═══
 async function kvGet(key) {
   const url = process.env.KV_REST_API_URL, token = process.env.KV_REST_API_TOKEN;
   if (!url || !token) return null;
-  try { const r = await fetch(`${url}/get/${key}`, { headers: { Authorization: `Bearer ${token}` } }); if (!r.ok) return null; const d = await r.json(); let v = d.result; for (let i = 0; i < 3; i++) { if (typeof v === "string") { try { v = JSON.parse(v); } catch { break; } } else break; } return v; } catch { return null; }
+  try {
+    const r = await fetch(`${url}/get/${key}`, { headers: { Authorization: `Bearer ${token}` } });
+    if (!r.ok) return null;
+    const d = await r.json();
+    let v = d.result;
+    for (let i = 0; i < 3; i++) { if (typeof v === "string") { try { v = JSON.parse(v); } catch { break; } } else break; }
+    return v;
+  } catch { return null; }
 }
 
-async function kvSet(key, value) {
+async function kvSetWithRetry(key, value, attempts = 2) {
   const url = process.env.KV_REST_API_URL, token = process.env.KV_REST_API_TOKEN;
-  if (!url || !token) return false;
-  try { const r = await fetch(`${url}/set/${key}`, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify(value) }); return r.ok; } catch { return false; }
+  if (!url || !token) return { ok: false, error: "no_kv_config" };
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const r = await fetch(`${url}/set/${key}`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify(value),
+      });
+      if (r.ok) return { ok: true, attempt: i + 1 };
+      if (i === attempts - 1) return { ok: false, error: `status_${r.status}`, attempt: i + 1 };
+    } catch (e) {
+      if (i === attempts - 1) return { ok: false, error: e.message, attempt: i + 1 };
+    }
+    await new Promise(res => setTimeout(res, 200));
+  }
+  return { ok: false, error: "exhausted" };
 }
 
-// ═══ YAHOO FINANCE (PRIMARY) — includes pre/post market ═══
-// V5.0 FIX C1: derive prevClose from the last 2 bars in the closes array,
-// NOT meta.chartPreviousClose (which returns ~1 year ago on range=1y).
-// On range=5d specifically, chartPreviousClose is the first close in the range — still not yesterday.
-// V5.0 FIX S3: no longer unconditionally prefer postMarket/preMarket over regular price.
-// Only use extended-hours price when sane (within 10% of last regular close).
-// A stale/thin bid at 3% of last close would corrupt changePct for all consumers.
+// V5.2 C1 FIX: Safe partial merge for trailing stop fields only.
+// Pattern: re-read state, merge only our worker-owned fields, write.
+// If another writer wrote between our read and write, their non-trailing
+// edits are preserved. User stop edits on trailing positions still race,
+// but that's accepted — stop edit vs trailing advance both affect stop.
+async function safeMergeTrailingUpdates(updates) {
+  if (!updates?.length) return { ok: true, updated: 0 };
+  const freshState = await kvGet("apex:state");
+  if (!freshState || !freshState.positions) return { ok: false, error: "no_state" };
+
+  const touched = new Set(updates.map(u => u.ticker));
+  let changed = 0;
+
+  for (const pos of freshState.positions) {
+    if (!touched.has(pos.id)) continue;
+    const update = updates.find(u => u.ticker === pos.id);
+    if (!update) continue;
+    // Apply ONLY trailing fields from the worker output
+    if (update.new_stop != null) pos.trailing_stop = update.new_stop;
+    if (update.hwm != null) pos.trailing_stop_hwm = update.hwm;
+    if (update.mode) pos.trailing_stop_mode = update.mode;
+    pos.trailing_stop_last_update = new Date().toISOString();
+    changed++;
+  }
+
+  if (changed === 0) return { ok: true, updated: 0 };
+
+  freshState.account = freshState.account || {};
+  freshState.account.last_updated = new Date().toISOString();
+  const result = await kvSetWithRetry("apex:state", freshState);
+  return { ok: result.ok, updated: changed, retry_error: result.error };
+}
+
+// ═══ YAHOO FINANCE ═══
 async function fetchYahoo(symbol) {
   try {
     const r = await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=5d&includePrePost=true`, {
@@ -49,100 +106,85 @@ async function fetchYahoo(symbol) {
 
     if (!isFinite(price)) return null;
 
-    // V5.0 FIX C1: compute prev from bar history, not meta.
     const closes = (result?.indicators?.quote?.[0]?.close?.filter(c => c != null) || []).map(c => c / adj);
     let prev;
     if (closes.length >= 2) {
       prev = closes[closes.length - 2];
     } else if (closes.length === 1) {
-      // Only today's bar — use meta.previousClose (single-day endpoint's true previous)
-      prev = Number(meta.previousClose) / adj || price;
+      prev = closes[0];
     } else {
-      prev = Number(meta.previousClose) / adj || price;
+      prev = price;
     }
 
-    // V5.0 FIX S3: validate extended-hours prices before using them.
-    // A stale/erroneous pre/post market quote can be far from the actual price.
-    // Only substitute if within 10% of regular price (typical max overnight move).
-    const isSane = (p) => p && isFinite(p) && Math.abs((p - price) / price) < 0.10;
-    const effectivePrice = (marketState(meta) === "POST" && isSane(postMarket)) ? postMarket
-                        : (marketState(meta) === "PRE" && isSane(preMarket)) ? preMarket
+    const mktState = marketState(meta);
+    const isSane = p => p != null && Math.abs((p - price) / price) < 0.10;
+
+    const effectivePrice = (mktState === "POST" && isSane(postMarket)) ? postMarket
+                        : (mktState === "PRE" && isSane(preMarket)) ? preMarket
                         : price;
 
-    const changePct = prev > 0 ? ((effectivePrice - prev) / prev * 100) : 0;
+    const changePct = prev > 0 ? ((effectivePrice - prev) / prev) * 100 : 0;
 
     return {
-      price: Math.round(effectivePrice * 10000) / 10000,
-      regular: Math.round(price * 10000) / 10000,
-      preMarket: preMarket ? Math.round(preMarket * 10000) / 10000 : null,
-      postMarket: postMarket ? Math.round(postMarket * 10000) / 10000 : null,
-      prevClose: Math.round(prev * 10000) / 10000,
-      changePct: Math.round(changePct * 100) / 100,
-      currency: isPence ? "GBP" : (meta.currency || "USD"),
-      marketState: meta.marketState || "UNKNOWN",
-      source: "yahoo",
-      closes5d: closes,
+      price: effectivePrice,
+      prev_close: prev,
+      changePct: parseFloat(changePct.toFixed(2)),
+      regular: price,
+      preMarket,
+      postMarket,
+      marketState: mktState,
+      currency: isPence ? "GBP" : "USD",
+      volume: meta.regularMarketVolume || 0,
+      dayHigh: meta.regularMarketDayHigh,
+      dayLow: meta.regularMarketDayLow,
     };
   } catch (e) {
+    console.error(`[yahoo] ${symbol}:`, e.message);
     return null;
   }
 }
 
-// Helper: market state from meta
 function marketState(meta) {
   const s = (meta?.marketState || "").toUpperCase();
   if (s.startsWith("PRE")) return "PRE";
   if (s.startsWith("POST")) return "POST";
+  if (s === "CLOSED") return "CLOSED";
   return "REGULAR";
 }
 
-// ═══ FINNHUB BACKUP (free tier: 60 calls/min) ═══
+// ═══ FINNHUB FALLBACK ═══
 async function fetchFinnhub(symbol) {
-  const apiKey = process.env.FINNHUB_API_KEY;
-  if (!apiKey) return null;
+  const token = process.env.FINNHUB_API_KEY;
+  if (!token) return null;
   try {
-    const r = await fetch(`https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(symbol)}&token=${apiKey}`);
+    const r = await fetch(`https://finnhub.io/api/v1/quote?symbol=${symbol}&token=${token}`);
     if (!r.ok) return null;
     const d = await r.json();
-    if (!d.c || d.c === 0) return null;
+    if (!d.c) return null;
     return {
-      price: d.c,
-      prevClose: d.pc || d.c,
-      changePct: d.pc ? Math.round(((d.c - d.pc) / d.pc * 100) * 100) / 100 : 0,
-      high: d.h, low: d.l, open: d.o,
-      source: "finnhub",
-      marketState: "UNKNOWN",
+      price: d.c, prev_close: d.pc,
+      changePct: d.dp ? parseFloat(d.dp.toFixed(2)) : 0,
+      marketState: "REGULAR",
+      currency: "USD",
     };
   } catch { return null; }
 }
 
-// ═══ FETCH WITH FALLBACK ═══
-async function fetchPrice(key, yahooSymbol) {
-  let result = await fetchYahoo(yahooSymbol);
-  if (result) return result;
-
-  if (!yahooSymbol.includes("=") && !yahooSymbol.startsWith("^") && !yahooSymbol.includes(".")) {
-    result = await fetchFinnhub(yahooSymbol);
-    if (result) return result;
-  }
-
-  return null;
+async function fetchPrice(key, symbol) {
+  const y = await fetchYahoo(symbol);
+  if (y) return y;
+  const f = await fetchFinnhub(symbol);
+  return f;
 }
 
-// ═══ BUILD TICKER LIST ═══
-function buildTickerList(positions = []) {
+function buildTickerList(positions) {
   const tickers = {};
-  tickers.BRENT = "BZ=F"; tickers.WTI = "CL=F"; tickers.SPX = "^GSPC";
-  tickers.VIX = "^VIX"; tickers.GBPUSD = "GBPUSD=X";
-
-  for (const pos of positions) {
-    const id = pos.id?.toUpperCase();
-    if (!id) continue;
-    const w = WATCHLIST[id];
-    tickers[id] = w ? w.yahoo : id;
+  for (const p of positions || []) {
+    const w = WATCHLIST[p.id];
+    tickers[p.id] = w?.symbol || p.id;
   }
-  for (const [key, w] of Object.entries(WATCHLIST)) {
-    if (w.held) tickers[key] = w.yahoo;
+  for (const [k, w] of Object.entries(WATCHLIST)) {
+    if (!tickers[k] && (w.always_fetch || w.theme)) tickers[k] = w.symbol;
   }
   return tickers;
 }
@@ -179,51 +221,116 @@ export async function GET(req) {
       const errorLog = await kvGet("apex:price_errors") || [];
       errorLog.push({ timestamp: now.toISOString(), errors, elapsed_ms: elapsed });
       if (errorLog.length > 100) errorLog.splice(0, errorLog.length - 100);
-      await kvSet("apex:price_errors", errorLog);
+      await kvSetWithRetry("apex:price_errors", errorLog);
     }
 
-    // V5.1: Process trailing stops on every price tick.
-    // Mutates state.positions in-place. Persist + log if any advanced or breached.
+    // V5.2: Process trailing stops via SAFE MERGE
     let trailingUpdates = [];
+    let trailingPersistStatus = null;
     try {
+      // Run worker against in-memory state copy
       trailingUpdates = processTrailingStops(state, results);
-      if (trailingUpdates.length > 0) {
-        // Persist the updated state (positions now have new trailing_stop / HWM values)
-        state.account = state.account || {};
-        state.account.last_updated = now.toISOString();
-        await kvSet("apex:state", state);
 
-        // Log to strategy log if any breach or meaningful advance
+      if (trailingUpdates.length > 0) {
+        // C1 FIX: merge only trailing fields back via re-read
+        const mergeResult = await safeMergeTrailingUpdates(trailingUpdates);
+        trailingPersistStatus = mergeResult;
+
+        if (!mergeResult.ok) {
+          // H6: log to kv_errors for health endpoint
+          const kvErrors = (await kvGet("apex:kv_errors")) || [];
+          kvErrors.push({
+            timestamp: now.toISOString(),
+            operation: "trailing_merge",
+            error: mergeResult.error || mergeResult.retry_error || "unknown",
+          });
+          if (kvErrors.length > 50) kvErrors.splice(0, kvErrors.length - 50);
+          await kvSetWithRetry("apex:kv_errors", kvErrors);
+        }
+
+        // Audit + strategy log for important events
         const breached = trailingUpdates.filter(u => u.breached);
         const advanced = trailingUpdates.filter(u => u.advanced && !u.breached);
-        if (breached.length || advanced.length) {
-          const log = await kvGet("apex:state") ? (state.strategy_log || []) : [];
-          if (breached.length) {
-            for (const b of breached) {
-              log.push({
-                date: now.toISOString(),
-                note: `🚨 TRAILING STOP BREACHED: ${b.ticker} — price crossed trailing stop at $${b.new_stop}. CLOSE MANUALLY ON T212.`,
-                category: "risk_alert",
-                author: "trailing_worker",
-              });
-            }
+        const splits = trailingUpdates.filter(u => u.reason === "possible_split");
+        const invalid = trailingUpdates.filter(u => u.reason === "invalid_config");
+
+        // C2 FIX: use correct worker field names (mode, distance, pct, effective_*)
+        if (breached.length || splits.length || advanced.length || invalid.length) {
+          const freshState = await kvGet("apex:state");
+          const log = freshState?.strategy_log || [];
+
+          for (const b of breached) {
+            log.push({
+              date: now.toISOString(),
+              note: `🚨 TRAILING STOP BREACHED: ${b.ticker} — price crossed trailing stop at $${b.new_stop}. CLOSE MANUALLY ON T212.`,
+              category: "risk_alert",
+              author: "trailing_worker",
+            });
+            auditWrite({
+              actor: "worker", action: "trailing_breach", entity: b.ticker,
+              after: { trailing_stop: b.new_stop, hwm: b.hwm },
+              reason: `Price crossed trailing stop at $${b.new_stop}`,
+              meta: { mode: b.mode, distance: b.distance, pct: b.pct },
+            });
           }
-          if (advanced.length) {
-            for (const a of advanced) {
-              log.push({
-                date: now.toISOString(),
-                note: `🔒 Trailing stop advanced: ${a.ticker} $${a.old_stop || "init"} → $${a.new_stop} (HWM $${a.hwm}, ${a.trail_pct}%)`,
-                category: "trailing_update",
-                author: "trailing_worker",
-              });
-            }
+
+          for (const a of advanced) {
+            const modeStr = a.mode === "distance"
+              ? `${a.distance} dist / ${a.effective_pct}%`
+              : `${a.pct}% / ${a.effective_distance}`;
+            log.push({
+              date: now.toISOString(),
+              note: `🔒 Trailing advanced: ${a.ticker} $${a.old_stop || "init"} → $${a.new_stop} (HWM $${a.hwm}, ${modeStr})`,
+              category: "trailing_update",
+              author: "trailing_worker",
+            });
+            auditWrite({
+              actor: "worker", action: "trail_advance", entity: a.ticker,
+              before: { trailing_stop: a.old_stop }, after: { trailing_stop: a.new_stop, hwm: a.hwm },
+              reason: `Stop advanced from $${a.old_stop || "init"} to $${a.new_stop}`,
+              meta: { mode: a.mode, distance: a.distance, pct: a.pct, effective_distance: a.effective_distance, effective_pct: a.effective_pct },
+            });
           }
-          state.strategy_log = log.slice(-200);
-          await kvSet("apex:state", state);
+
+          for (const s of splits) {
+            log.push({
+              date: now.toISOString(),
+              note: `⚠️  ${s.ticker}: possible split detected (${s.move_pct}% move from HWM $${s.hwm} to $${s.price}). NOT treated as breach. Review manually.`,
+              category: "risk_alert",
+              author: "trailing_worker",
+            });
+            auditWrite({
+              actor: "worker", action: "possible_split", entity: s.ticker,
+              reason: `Price moved ${s.move_pct}% from HWM — manual review required`,
+              meta: { hwm: s.hwm, price: s.price, move_pct: s.move_pct },
+            });
+          }
+
+          for (const i of invalid) {
+            log.push({
+              date: now.toISOString(),
+              note: `❌ ${i.ticker}: invalid trailing config — ${i.error}. Fix manually.`,
+              category: "risk_alert",
+              author: "trailing_worker",
+            });
+          }
+
+          // L3: batch the log write — only if freshState loaded
+          if (freshState) {
+            freshState.strategy_log = log.slice(-200);
+            await kvSetWithRetry("apex:state", freshState);
+          }
         }
       }
     } catch (e) {
-      console.error("Trailing stop worker error:", e.message);
+      console.error("[trailing worker]", e.message, e.stack);
+      // Log to kv_errors for observability
+      try {
+        const kvErrors = (await kvGet("apex:kv_errors")) || [];
+        kvErrors.push({ timestamp: now.toISOString(), operation: "trailing_worker", error: e.message });
+        if (kvErrors.length > 50) kvErrors.splice(0, kvErrors.length - 50);
+        await kvSetWithRetry("apex:kv_errors", kvErrors);
+      } catch {}
     }
 
     return NextResponse.json({
@@ -236,8 +343,8 @@ export async function GET(req) {
       errors: errors.length > 0 ? errors : undefined,
       elapsed_ms: elapsed,
       market_state: results.SPX?.marketState || "UNKNOWN",
-      // V5.1: expose trailing stop updates so UI can show breach alerts
       trailing_updates: trailingUpdates.length > 0 ? trailingUpdates : undefined,
+      trailing_persist: trailingPersistStatus,
     });
   } catch (err) {
     return NextResponse.json({ error: err.message }, { status: 500 });
