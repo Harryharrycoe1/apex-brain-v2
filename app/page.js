@@ -1,6 +1,6 @@
 "use client";
-import { useState, useEffect, useRef, useCallback } from "react";
-import { Send, RefreshCw, Plus, X, TrendingUp, TrendingDown, Search, LogOut, ArrowUpDown, BarChart3, Newspaper, Activity, Target, Edit3, ChevronRight } from "lucide-react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import { Send, RefreshCw, Plus, X, TrendingUp, TrendingDown, Search, LogOut, ArrowUpDown, BarChart3, Newspaper, Activity, Target, Edit3, ChevronRight, Shield } from "lucide-react";
 
 const T={bg:"#0a0a0f",card:"#12121a",cardHover:"#1a1a2e",border:"#1e1e2e",gold:"#d4a843",green:"#10b981",red:"#ef4444",amber:"#f59e0b",text:"#e2e8f0",textDim:"#64748b",mono:"'JetBrains Mono',monospace",sans:"'DM Sans',sans-serif"};
 function fmt(v,d=2){const n=Number(v);return isFinite(n)?n.toFixed(d):"—";}
@@ -37,6 +37,10 @@ export default function ApexBrain(){
   const[closePos,setClosePos]=useState(null);
   const[showDeposit,setShowDeposit]=useState(false);
   const[depositAmount,setDepositAmount]=useState("");
+  // V5.2: rule engine state
+  const[ruleStatus,setRuleStatus]=useState(null);
+  const[pendingRuleConfirm,setPendingRuleConfirm]=useState(null); // { action, body, warnings, blockers }
+  const[auditEntries,setAuditEntries]=useState([]);
   const chatEnd=useRef(null);
   const chatScroller=useRef(null);
   const lastMsgCount=useRef(0);
@@ -53,6 +57,9 @@ export default function ApexBrain(){
   const loadHealth=useCallback(async()=>{if(!accessKey)return;try{const r=await fetch("/api/health",{headers:{"x-apex-key":accessKey}});if(r.ok)setHealth(await r.json());else console.error("loadHealth HTTP "+r.status);}catch(e){console.error("loadHealth:",e.message);}},[accessKey]);
   const loadScanner=useCallback(async()=>{if(!accessKey)return;setScannerLoading(true);try{const r=await fetch("/api/scanner",{headers:{"x-apex-key":accessKey}});if(r.ok){const d=await r.json();setScanner(d);setScannerTime(new Date().toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit",timeZone:"Europe/London"}));}else console.error("loadScanner HTTP "+r.status);}catch(e){console.error("loadScanner:",e.message);}setScannerLoading(false);},[accessKey]);
   const loadRegime=useCallback(async()=>{if(!accessKey)return;try{const r=await fetch("/api/regime",{headers:{"x-apex-key":accessKey}});if(r.ok){const d=await r.json();setRegime(d);}}catch(e){console.error("loadRegime:",e.message);}},[accessKey]);
+  // V5.2: rule status + audit loaders
+  const loadRuleStatus=useCallback(async()=>{if(!accessKey)return;try{const r=await fetch("/api/rules",{headers:{"x-apex-key":accessKey}});if(r.ok){const d=await r.json();setRuleStatus(d);}}catch(e){console.error("loadRuleStatus:",e.message);}},[accessKey]);
+  const loadAudit=useCallback(async()=>{if(!accessKey)return;try{const r=await fetch("/api/audit?limit=100",{headers:{"x-apex-key":accessKey}});if(r.ok){const d=await r.json();setAuditEntries(d.entries||[]);}}catch(e){console.error("loadAudit:",e.message);}},[accessKey]);
   const loadPeaceSignal=useCallback(async()=>{if(!accessKey)return;try{const r=await fetch("/api/altdata?source=peace_signal",{headers:{"x-apex-key":accessKey}});if(r.ok){const d=await r.json();setPeaceSignal(d.peace_signal);}}catch(e){console.error("loadPeaceSignal:",e.message);}},[accessKey]);
   const loadStrategyLog=useCallback(async()=>{if(!accessKey)return;try{const r=await fetch("/api/state",{method:"POST",headers:{"Content-Type":"application/json","x-apex-key":accessKey},body:JSON.stringify({action:"get_strategy_log"})});if(r.ok){const d=await r.json();setStrategyLog(d.log||[]);}}catch(e){console.error("loadStrategyLog:",e.message);}},[accessKey]);
   const loadSocial=useCallback(async()=>{if(!accessKey)return;try{const r=await fetch("/api/social",{headers:{"x-apex-key":accessKey}});if(r.ok){const d=await r.json();
@@ -82,8 +89,10 @@ export default function ApexBrain(){
   useEffect(()=>{if(tab!=="pipeline"||!authed)return;const iv=setInterval(()=>{loadScanner();loadState();loadPrices();},300000);return()=>clearInterval(iv);},[tab,authed,loadScanner,loadState,loadPrices]);
   useEffect(()=>{if(tab==="performance"){loadStrategyLog();loadRegime();loadState();loadPrices();}},[tab,loadStrategyLog,loadRegime,loadState,loadPrices]);
   useEffect(()=>{if(tab!=="performance"||!authed)return;const iv=setInterval(()=>{loadState();loadPrices();loadStrategyLog();},60000);return()=>clearInterval(iv);},[tab,authed,loadState,loadPrices,loadStrategyLog]);
-  useEffect(()=>{if(authed){loadRegime();loadPeaceSignal();}},[authed,loadRegime,loadPeaceSignal]);
-  useEffect(()=>{if(!authed)return;const iv=setInterval(()=>{loadRegime();loadPeaceSignal();},1800000);return()=>clearInterval(iv);},[authed,loadRegime,loadPeaceSignal]);
+  useEffect(()=>{if(authed){loadRegime();loadPeaceSignal();loadRuleStatus();}},[authed,loadRegime,loadPeaceSignal,loadRuleStatus]);
+  useEffect(()=>{if(!authed)return;const iv=setInterval(()=>{loadRegime();loadPeaceSignal();loadRuleStatus();},1800000);return()=>clearInterval(iv);},[authed,loadRegime,loadPeaceSignal,loadRuleStatus]);
+  useEffect(()=>{if(tab==="audit")loadAudit();},[tab,loadAudit]);
+  useEffect(()=>{if(tab!=="audit"||!authed)return;const iv=setInterval(loadAudit,60000);return()=>clearInterval(iv);},[tab,authed,loadAudit]);
   useEffect(()=>{if(messages.length>lastMsgCount.current&&chatScroller.current){chatScroller.current.scrollTop=chatScroller.current.scrollHeight;lastMsgCount.current=messages.length;}},[messages]);
 
   // SEND MESSAGE
@@ -92,19 +101,53 @@ export default function ApexBrain(){
     setMessages(p=>[...p,{role:"assistant",content:d.content,pathway:d.pathway,urgency:d.urgency,compliance:d.compliance,cost:d.cost,algo:d.algo}]);
     if(d.pathway==="command"||d.pathway==="chat_command"||d.state_changed){await loadState();await loadPrices();loadStrategyLog();}}catch(err){setMessages(p=>[...p,{role:"assistant",content:`❌ ${err.message}`}]);}setLoading(false);};
 
-  // STATE ACTION
-  const stateAction=async(action,body)=>{try{const r=await fetch("/api/state",{method:"POST",headers:{"Content-Type":"application/json","x-apex-key":accessKey},body:JSON.stringify({action,...body})});const d=await r.json();if(!d.error)await loadState();return d;}catch(e){return{error:e.message};}};
+  // STATE ACTION — V5.2: surfaces rule violations (409 warns, 422 blocks)
+  const stateAction=async(action,body)=>{try{const r=await fetch("/api/state",{method:"POST",headers:{"Content-Type":"application/json","x-apex-key":accessKey},body:JSON.stringify({action,...body})});const d=await r.json();
+    // V5.2: if rule warnings, open confirm modal
+    if(r.status===409&&d.requires_confirmation){setPendingRuleConfirm({action,body,warnings:d.warnings||d.violations||[],blockers:[]});return{requires_confirmation:true};}
+    if(r.status===422&&d.blocked){setPendingRuleConfirm({action,body,warnings:[],blockers:d.violations||[]});return{blocked:true};}
+    if(!d.error)await loadState();return d;}catch(e){return{error:e.message};}};
+
+  // V5.2: resubmit with confirm_overrides after user acknowledges warnings
+  const confirmRuleOverrides=async()=>{
+    if(!pendingRuleConfirm||!pendingRuleConfirm.warnings.length)return;
+    const overrides=pendingRuleConfirm.warnings.map(w=>w.rule);
+    const r=await fetch("/api/state",{method:"POST",headers:{"Content-Type":"application/json","x-apex-key":accessKey},body:JSON.stringify({action:pendingRuleConfirm.action,...pendingRuleConfirm.body,confirm_overrides:overrides})});
+    const d=await r.json();
+    if(d.ok){setPendingRuleConfirm(null);await loadState();await loadRuleStatus();
+      if(pendingRuleConfirm.action==="add_position"){setShowAdd(false);setAddForm({ticker:"",units:"",entry:"",stop:"",t1:"",t2:"",sleeve:"B",direction:"buy",thesis:"",kill_switch:"",sector:"",currency:"USD"});}
+      if(pendingRuleConfirm.action==="update_position"){setEditPos(null);}
+    }
+  };
+  const cancelRuleConfirm=()=>setPendingRuleConfirm(null);
 
   // ADD POSITION
-  const[addForm,setAddForm]=useState({ticker:"",units:"",entry:"",stop:"",t1:"",t2:"",sleeve:"B",direction:"buy",thesis:""});
-  const addPosition=async()=>{const d=await stateAction("add_position",{ticker:addForm.ticker,units:addForm.units,entry_price:addForm.entry,stop:addForm.stop||null,t1:addForm.t1||null,t2:addForm.t2||null,sleeve:addForm.sleeve,direction:addForm.direction,thesis:addForm.thesis});if(d?.ok){setShowAdd(false);setAddForm({ticker:"",units:"",entry:"",stop:"",t1:"",t2:"",sleeve:"B",direction:"buy",thesis:""});}};
+  const[addForm,setAddForm]=useState({ticker:"",units:"",entry:"",stop:"",t1:"",t2:"",sleeve:"B",direction:"buy",thesis:"",kill_switch:"",sector:"",currency:"USD"});
+  const addPosition=async()=>{const d=await stateAction("add_position",{ticker:addForm.ticker,units:addForm.units,entry_price:addForm.entry,stop:addForm.stop||null,t1:addForm.t1||null,t2:addForm.t2||null,sleeve:addForm.sleeve,direction:addForm.direction,thesis:addForm.thesis,kill_switch:addForm.kill_switch,sector:addForm.sector,currency:addForm.currency});if(d?.ok){setShowAdd(false);setAddForm({ticker:"",units:"",entry:"",stop:"",t1:"",t2:"",sleeve:"B",direction:"buy",thesis:"",kill_switch:"",sector:"",currency:"USD"});await loadRuleStatus();}};
+
+  // V5.2: Position sizing calculator — live R:R + max loss as user types
+  const sizingCalc=useMemo(()=>{
+    const entry=Number(addForm.entry),stop=Number(addForm.stop),t1=Number(addForm.t1),units=Number(addForm.units);
+    const dir=addForm.direction||"buy";const isLong=dir!=="short"&&dir!=="sell";
+    if(!entry||!stop||!units)return null;
+    const risk=isLong?entry-stop:stop-entry;
+    const reward=t1?(isLong?t1-entry:entry-t1):null;
+    const rr=reward&&risk>0?reward/risk:null;
+    const maxLoss=Math.abs(risk)*units;
+    const currency=addForm.currency||"USD";
+    const fx=currency==="GBP"?1:(state?.account?.gbp_usd?1/state.account.gbp_usd:1/1.34);
+    const maxLossGbp=maxLoss*fx;
+    const nav=state?.account?.nav||1;
+    const lossPct=(maxLossGbp/nav)*100;
+    return{rr,maxLossGbp,lossPct,stopOnWrongSide:isLong?stop>=entry:stop<=entry,currency};
+  },[addForm,state]);
 
   // SYNC
   const[syncForm,setSyncForm]=useState({nav:"",cash:"",margin:"",health:""});
   const doSync=async()=>{await stateAction("sync_account",{nav:syncForm.nav||undefined,cash:syncForm.cash||undefined,margin:syncForm.margin||undefined,health:syncForm.health||undefined});setShowSync(false);setSyncForm({nav:"",cash:"",margin:"",health:""});};
 
   // EDIT POSITION
-  const saveEdit=async()=>{if(!editPos)return;const d=await stateAction("update_position",editPos);if(d?.ok)setEditPos(null);};
+  const saveEdit=async()=>{if(!editPos)return;const livePrice=prices[editPos.ticker]?.price;const d=await stateAction("update_position",{...editPos,live_price:livePrice});if(d?.ok)setEditPos(null);};
 
   // CLOSE POSITION (full or partial)
   const executeClose=async()=>{
@@ -151,7 +194,7 @@ export default function ApexBrain(){
   const staleness=state?.account?.last_updated?Math.floor((Date.now()-new Date(state.account.last_updated).getTime())/3600000):null;
 
   // ═══ TABS ═══
-  const TABS=[{id:"chat",icon:"💬",label:"Chat"},{id:"positions",icon:"📊",label:"Positions"},{id:"pipeline",icon:"🎯",label:"Pipeline"},{id:"performance",icon:"📈",label:"Performance"},{id:"news",icon:"📰",label:"News"},{id:"health",icon:"🏥",label:"Health"}];
+  const TABS=[{id:"chat",icon:"💬",label:"Chat"},{id:"positions",icon:"📊",label:"Positions"},{id:"pipeline",icon:"🎯",label:"Pipeline"},{id:"performance",icon:"📈",label:"Performance"},{id:"news",icon:"📰",label:"News"},{id:"health",icon:"🏥",label:"Health"},{id:"audit",icon:"📜",label:"Audit"}];
 
   return(
     <div style={{height:"100vh",display:"flex",flexDirection:"column",background:T.bg,fontFamily:T.sans,overflow:"hidden"}}>
@@ -174,6 +217,19 @@ export default function ApexBrain(){
         {[{l:"NAV",v:`£${fmt(account.nav,0)}`,c:T.text},{l:"P&L",v:`${totalOpenPL>=0?"+":""}£${fmt(totalOpenPL)}`,c:totalOpenPL>=0?T.green:T.red},{l:"REAL",v:`+£${fmt(account.total_realised_pl)}`,c:T.green},{l:"HLTH",v:`${account.margin_health_pct||"—"}%`,c:(account.margin_health_pct||100)>50?T.green:T.red}].map((d,i)=>(<div key={i} style={{textAlign:"center",minWidth:55}}><div style={{fontSize:8,color:T.textDim,letterSpacing:1}}>{d.l}</div><div style={{fontSize:13,fontWeight:700,color:d.c,fontFamily:T.mono}}>{d.v}</div></div>))}
       </div>
 
+      {/* V5.2: RULE STATUS BANNER — shows when fund is at ELEVATED or HALT */}
+      {ruleStatus&&(ruleStatus.risk_level==="HALT"||ruleStatus.risk_level==="ELEVATED")&&(
+        <div onClick={()=>setTab("audit")} style={{padding:"6px 12px",background:ruleStatus.risk_level==="HALT"?"#3b1515":"#3b2d15",color:ruleStatus.risk_level==="HALT"?T.red:T.amber,fontSize:10,cursor:"pointer",borderBottom:`1px solid ${T.border}`,display:"flex",justifyContent:"space-between",alignItems:"center",gap:6}}>
+          <span style={{display:"flex",alignItems:"center",gap:6,flexWrap:"wrap"}}>
+            <Shield size={12}/><b>{ruleStatus.risk_level==="HALT"?"🚨 R4 HALT":"⚠️ ELEVATED"}</b>
+            <span>DD {fmt(ruleStatus.drawdown_pct,1)}%</span>
+            {ruleStatus.monthly_pl?.valid&&<span>| MTD {ruleStatus.monthly_pl.pct>=0?"+":""}{fmt(ruleStatus.monthly_pl.pct,1)}%</span>}
+            <span>| {ruleStatus.position_count}/{ruleStatus.position_cap}</span>
+          </span>
+          <span style={{fontSize:9,opacity:0.8}}>{ruleStatus.blocked_actions.length>0?"NEW POSITIONS BLOCKED":"Tap for details"}</span>
+        </div>
+      )}
+
       {staleness>4&&<div onClick={()=>setShowSync(true)} style={{padding:"3px 12px",background:"#3b1515",color:T.red,fontSize:10,cursor:"pointer",textAlign:"center"}}>⚠️ DATA {staleness}h OLD — Tap to sync</div>}
 
       {/* TAB BAR */}
@@ -193,7 +249,7 @@ export default function ApexBrain(){
           </div>)}
           <div ref={chatScroller} style={{flex:1,overflowY:"auto",padding:"8px 12px"}}>
             {messages.length===0&&(<div style={{textAlign:"center",marginTop:40,color:T.textDim}}>
-              <div style={{fontSize:36,marginBottom:6}}>🧠</div><div style={{fontSize:13,fontWeight:600}}>APEX BRAIN V5.1</div>
+              <div style={{fontSize:36,marginBottom:6}}>🧠</div><div style={{fontSize:13,fontWeight:600}}>APEX BRAIN V5.2</div>
               <div style={{fontSize:10,marginTop:4}}>Chat commands: "move JPM stop to 300" • "close BAC at 54" • "BAC T1 to 57"</div>
               <div style={{display:"flex",flexWrap:"wrap",gap:4,justifyContent:"center",marginTop:12}}>
                 {["Morning brief","How are my positions?","Weekly review","BAC earnings prep","What's the regime?","Scan for opportunities"].map((q,i)=>(<button key={i} onClick={()=>sendMessage(q)} style={{padding:"5px 10px",background:T.card,border:`1px solid ${T.border}`,borderRadius:14,color:T.textDim,fontSize:10,cursor:"pointer"}}>{q}</button>))}
@@ -775,6 +831,51 @@ export default function ApexBrain(){
           </>)}
           {!health&&<div style={{color:T.textDim,fontSize:12,padding:20,textAlign:"center"}}>Loading health data...</div>}
         </div>)}
+
+        {/* ═══ V5.2 AUDIT TAB ═══ */}
+        {tab==="audit"&&(<div style={{padding:"8px 12px"}}>
+          {ruleStatus&&(<div style={{padding:"10px 12px",background:T.card,borderRadius:8,marginBottom:8,border:`1px solid ${ruleStatus.risk_level==="HALT"?T.red:ruleStatus.risk_level==="ELEVATED"?T.amber:T.border}`}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
+              <span style={{fontSize:11,fontWeight:700,color:T.gold,letterSpacing:1}}>🛡️ RULE STATUS</span>
+              <span style={{fontSize:10,padding:"2px 8px",borderRadius:4,background:ruleStatus.risk_level==="HALT"?T.red+"30":ruleStatus.risk_level==="ELEVATED"?T.amber+"30":T.green+"30",color:ruleStatus.risk_level==="HALT"?T.red:ruleStatus.risk_level==="ELEVATED"?T.amber:T.green,fontWeight:700}}>{ruleStatus.risk_level}</span>
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,fontSize:10,color:T.textDim}}>
+              <div>NAV: <span style={{color:T.text,fontFamily:T.mono}}>£{fmt(ruleStatus.nav,2)}</span></div>
+              <div>HWM: <span style={{color:T.text,fontFamily:T.mono}}>£{fmt(ruleStatus.high_water_mark,2)}</span></div>
+              <div>Drawdown: <span style={{color:ruleStatus.drawdown_pct>=15?T.red:ruleStatus.drawdown_pct>=10?T.amber:T.green,fontFamily:T.mono,fontWeight:700}}>{fmt(ruleStatus.drawdown_pct,2)}%</span></div>
+              <div>Positions: <span style={{color:T.text,fontFamily:T.mono}}>{ruleStatus.position_count}/{ruleStatus.position_cap}</span></div>
+              {ruleStatus.monthly_pl?.valid&&(<div>MTD: <span style={{color:ruleStatus.monthly_pl.pct>=0?T.green:T.red,fontFamily:T.mono,fontWeight:700}}>{ruleStatus.monthly_pl.pct>=0?"+":""}{fmt(ruleStatus.monthly_pl.pct,2)}%</span></div>)}
+            </div>
+            {ruleStatus.warnings&&ruleStatus.warnings.length>0&&(<div style={{marginTop:6,padding:6,background:T.cardHover,borderRadius:4}}>
+              {ruleStatus.warnings.map((w,i)=>(<div key={i} style={{fontSize:10,color:T.amber,marginBottom:2}}>⚠️ {w}</div>))}
+            </div>)}
+          </div>)}
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
+            <span style={{fontSize:10,color:T.textDim,letterSpacing:1,textTransform:"uppercase"}}>AUDIT TRAIL ({auditEntries.length} entries)</span>
+            <button onClick={loadAudit} style={{...btnS,background:T.card,padding:"4px 8px"}}><RefreshCw size={11}/></button>
+          </div>
+          {auditEntries.length===0&&<div style={{color:T.textDim,fontSize:12,padding:20,textAlign:"center"}}>No audit entries yet.</div>}
+          {auditEntries.map((e,i)=>{
+            const actorColor=e.actor==="user"?T.gold:e.actor==="worker"?T.green:e.actor==="system"?T.textDim:T.text;
+            const actionIcon={open_position:"➕",close_position:"❌",partial_close:"➖",edit_position:"✏️",move_stop:"🔄",deposit:"💷",nav_sync:"🔁",trailing_breach:"🚨",trail_advance:"🔒",possible_split:"⚠️",month_rollover:"📅",rule_override:"⚠️"}[e.action]||"•";
+            return(<div key={e.id||i} style={{padding:"6px 10px",background:T.card,borderRadius:6,marginBottom:4,borderLeft:`2px solid ${actorColor}`}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:8,flexWrap:"wrap"}}>
+                <span style={{display:"flex",alignItems:"center",gap:4,flexWrap:"wrap"}}>
+                  <span>{actionIcon}</span>
+                  <span style={{fontSize:11,fontWeight:700,color:T.text}}>{e.action}</span>
+                  <span style={{fontSize:9,color:T.textDim}}>{e.entity}</span>
+                  <span style={{fontSize:8,color:actorColor,textTransform:"uppercase",letterSpacing:0.5}}>[{e.actor}]</span>
+                </span>
+                <span style={{fontSize:8,color:T.textDim,fontFamily:T.mono}}>{new Date(e.ts).toLocaleString("en-GB",{timeZone:"Europe/London",day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit"})}</span>
+              </div>
+              {e.reason&&<div style={{fontSize:10,color:T.textDim,marginTop:3}}>{e.reason}</div>}
+              {e.before&&e.after&&(<div style={{fontSize:9,color:T.textDim,marginTop:3,fontFamily:T.mono,background:T.cardHover,padding:"3px 5px",borderRadius:3}}>
+                {Object.keys(e.after).map(k=>e.before[k]!==e.after[k]?(<div key={k}>{k}: <span style={{color:T.red}}>{JSON.stringify(e.before[k])}</span> → <span style={{color:T.green}}>{JSON.stringify(e.after[k])}</span></div>):null)}
+              </div>)}
+              {e.meta?.rule_overrides&&e.meta.rule_overrides.length>0&&(<div style={{fontSize:9,color:T.amber,marginTop:3}}>⚠️ Overrode: {e.meta.rule_overrides.join(", ")}</div>)}
+            </div>);
+          })}
+        </div>)}
       </div>
 
       {/* PRICE FOOTER */}
@@ -789,13 +890,40 @@ export default function ApexBrain(){
           <Inp p="Ticker" v={addForm.ticker} c={v=>setAddForm(p=>({...p,ticker:v.toUpperCase()}))}/>
           <Inp p="Units" v={addForm.units} c={v=>setAddForm(p=>({...p,units:v}))} t="number"/>
           <Inp p="Entry $" v={addForm.entry} c={v=>setAddForm(p=>({...p,entry:v}))} t="number"/>
-          <Inp p="Stop $" v={addForm.stop} c={v=>setAddForm(p=>({...p,stop:v}))} t="number"/>
+          <Inp p="Stop $ (R1 required)" v={addForm.stop} c={v=>setAddForm(p=>({...p,stop:v}))} t="number"/>
           <Inp p="T1 $" v={addForm.t1} c={v=>setAddForm(p=>({...p,t1:v}))} t="number"/>
           <Inp p="T2 $" v={addForm.t2} c={v=>setAddForm(p=>({...p,t2:v}))} t="number"/>
           <Sel v={addForm.sleeve} c={v=>setAddForm(p=>({...p,sleeve:v}))} opts={[["A","Sleeve A"],["B","Sleeve B"],["C","Sleeve C"],["Independent","Independent"]]}/>
           <Sel v={addForm.direction} c={v=>setAddForm(p=>({...p,direction:v}))} opts={[["buy","LONG"],["short","SHORT"]]}/>
+          <Inp p="Sector (for R7 audit)" v={addForm.sector} c={v=>setAddForm(p=>({...p,sector:v}))}/>
+          <Sel v={addForm.currency} c={v=>setAddForm(p=>({...p,currency:v}))} opts={[["USD","USD $"],["GBP","GBP £ (pence)"]]}/>
         </div>
-        <Inp p="Thesis" v={addForm.thesis} c={v=>setAddForm(p=>({...p,thesis:v}))} full/>
+
+        {/* V5.2: Live position sizing calculator */}
+        {sizingCalc&&(<div style={{marginTop:8,padding:"8px 10px",background:T.card,borderRadius:6,border:`1px solid ${sizingCalc.stopOnWrongSide?T.red:sizingCalc.lossPct>1?T.amber:T.border}`}}>
+          <div style={{fontSize:9,color:T.textDim,letterSpacing:1,marginBottom:4}}>📐 LIVE SIZING</div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:6,fontSize:11}}>
+            <div>R:R: <span style={{color:sizingCalc.rr>=3?T.green:sizingCalc.rr>=2?T.amber:T.red,fontWeight:700,fontFamily:T.mono}}>{sizingCalc.rr?fmt(sizingCalc.rr,2)+":1":"—"}</span></div>
+            <div>Max Loss: <span style={{color:T.text,fontFamily:T.mono}}>£{fmt(sizingCalc.maxLossGbp,2)}</span></div>
+            <div>% NAV: <span style={{color:sizingCalc.lossPct>1?T.red:sizingCalc.lossPct>0.5?T.amber:T.green,fontWeight:700,fontFamily:T.mono}}>{fmt(sizingCalc.lossPct,2)}%</span></div>
+          </div>
+          {sizingCalc.stopOnWrongSide&&<div style={{fontSize:10,color:T.red,marginTop:4}}>🚨 Stop is on WRONG side of entry for this direction.</div>}
+          {sizingCalc.lossPct>1&&!sizingCalc.stopOnWrongSide&&<div style={{fontSize:10,color:T.amber,marginTop:4}}>⚠️ Max loss exceeds R2 1% NAV cap. Reduce units or tighten stop.</div>}
+          {sizingCalc.rr&&sizingCalc.rr<3&&<div style={{fontSize:10,color:T.amber,marginTop:4}}>⚠️ R:R below 3:1 Operating Bible minimum.</div>}
+        </div>)}
+
+        {/* V5.2: Thesis REQUIRED */}
+        <div style={{marginTop:6,fontSize:9,color:addForm.thesis.length>=10?T.green:T.amber,letterSpacing:0.5}}>
+          💭 THESIS (required, min 10 chars): {addForm.thesis.length}/10
+        </div>
+        <Inp p="Why does this trade work? (Book of Wisdom R16)" v={addForm.thesis} c={v=>setAddForm(p=>({...p,thesis:v}))} full/>
+
+        {/* V5.2: Kill switch REQUIRED */}
+        <div style={{marginTop:6,fontSize:9,color:addForm.kill_switch.length>=5?T.green:T.amber,letterSpacing:0.5}}>
+          🎯 KILL SWITCH (required, min 5 chars): {addForm.kill_switch.length}/5
+        </div>
+        <Inp p="Single event that invalidates this thesis" v={addForm.kill_switch} c={v=>setAddForm(p=>({...p,kill_switch:v}))} full/>
+
         <Btn onClick={addPosition}>Open Position</Btn>
       </Modal>}
 
@@ -849,6 +977,10 @@ export default function ApexBrain(){
               {mode==="distance"?`T212-style: stop stays ${curr}X below high-water-mark. E.g. ${curr}3 means $3 below HWM.`:mode==="pct"?`Percentage-based: stop = HWM × (1 - N/100). E.g. 5 = 5% below HWM.`:`Pick Distance (T212 style) or Percentage to enable trailing.`}
               {editPos.trailing_stop_hwm?` | HWM: ${curr}${editPos.trailing_stop_hwm}`:hasActive?` | HWM will be set from first price tick.`:""}
             </div>
+            {hasActive&&editPos.trailing_stop_hwm&&(<div style={{marginTop:6,display:"flex",gap:4,alignItems:"center"}}>
+              <Inp p={`HWM ${curr} (override)`} v={editPos.trailing_stop_hwm} c={v=>setEditPos(p=>({...p,trailing_stop_hwm:v}))} t="number"/>
+              <button onClick={()=>setEditPos(p=>({...p,trailing_stop_hwm:""}))} title="Clear HWM — worker will re-initialize from next price tick (fixes split/dividend anomalies)" style={{padding:"6px 10px",background:T.cardHover,border:`1px solid ${T.amber}`,borderRadius:4,color:T.amber,fontSize:10,cursor:"pointer",whiteSpace:"nowrap"}}>↻ Reset HWM</button>
+            </div>)}
             {hasActive&&<button onClick={()=>setEditPos(p=>({...p,trailing_stop_mode:"",trailing_stop_distance:"",trailing_stop_pct:"",trailing_stop:"",trailing_stop_hwm:""}))} style={{marginTop:6,padding:"4px 8px",background:T.cardHover,border:`1px solid ${T.red}`,borderRadius:4,color:T.red,fontSize:10,cursor:"pointer"}}>Disable Trailing</button>}
           </div>);
         })()}
@@ -908,6 +1040,36 @@ export default function ApexBrain(){
         <Btn onClick={executeClose}>{Number(closePos.units)>=closePos.max_units?"🔴 FULL CLOSE":"🟡 PARTIAL CLOSE"}</Btn>
       </Modal>}
 
+      {/* V5.2: RULE CONFIRM MODAL — shows when state route returns 409 or 422 */}
+      {pendingRuleConfirm&&<Modal title={pendingRuleConfirm.blockers.length>0?"🚨 RULE BLOCK":"⚠️ RULE WARNINGS"} onClose={cancelRuleConfirm}>
+        <div style={{padding:"10px",background:pendingRuleConfirm.blockers.length>0?"#3b1515":"#3b2d15",borderRadius:8,marginBottom:10,fontSize:11,color:pendingRuleConfirm.blockers.length>0?T.red:T.amber}}>
+          {pendingRuleConfirm.blockers.length>0?<>
+            <div style={{fontWeight:700,marginBottom:6,letterSpacing:1}}>❌ CANNOT PROCEED — BLOCKED BY OPERATING BIBLE:</div>
+            {pendingRuleConfirm.blockers.map((v,i)=>(<div key={i} style={{marginBottom:4,paddingLeft:10}}>
+              <div style={{fontWeight:700}}>{v.rule}</div>
+              <div style={{fontSize:10,color:T.text,opacity:0.9}}>{v.message}</div>
+            </div>))}
+          </>:<>
+            <div style={{fontWeight:700,marginBottom:6,letterSpacing:1}}>⚠️ THIS WOULD VIOLATE RULES — CONFIRM TO OVERRIDE:</div>
+            {pendingRuleConfirm.warnings.map((v,i)=>(<div key={i} style={{marginBottom:4,paddingLeft:10}}>
+              <div style={{fontWeight:700}}>{v.rule}</div>
+              <div style={{fontSize:10,color:T.text,opacity:0.9}}>{v.message}</div>
+            </div>))}
+          </>}
+        </div>
+        <div style={{padding:"8px 10px",background:T.card,borderRadius:6,marginBottom:10,fontSize:10,color:T.textDim}}>
+          Action: <span style={{color:T.text,fontFamily:T.mono}}>{pendingRuleConfirm.action}</span> · Ticker: <span style={{color:T.text,fontFamily:T.mono}}>{pendingRuleConfirm.body.ticker||pendingRuleConfirm.body.id||"—"}</span>
+          {pendingRuleConfirm.body.units&&<span> · Units: <span style={{color:T.text,fontFamily:T.mono}}>{pendingRuleConfirm.body.units}</span></span>}
+        </div>
+        <div style={{display:"flex",gap:6}}>
+          <button onClick={cancelRuleConfirm} style={{flex:1,padding:"10px",background:T.cardHover,border:`1px solid ${T.border}`,borderRadius:6,color:T.text,fontWeight:700,fontSize:12,cursor:"pointer"}}>Cancel</button>
+          {pendingRuleConfirm.blockers.length===0&&(
+            <button onClick={confirmRuleOverrides} style={{flex:1,padding:"10px",background:T.amber,border:"none",borderRadius:6,color:"#000",fontWeight:700,fontSize:12,cursor:"pointer"}}>Override & Proceed</button>
+          )}
+        </div>
+        {pendingRuleConfirm.warnings.length>0&&(<div style={{marginTop:8,fontSize:9,color:T.textDim,fontStyle:"italic"}}>Every override is logged to audit trail with reason. Operating Bible violations should be rare and deliberate.</div>)}
+      </Modal>}
+
       {showDeposit&&<Modal title="💷 Add Capital to Fund" onClose={()=>{setShowDeposit(false);setDepositAmount("");}}>
         <div style={{padding:"10px",background:T.card,borderRadius:8,marginBottom:10,border:`1px solid ${T.border}`,fontSize:11}}>
           <div style={{display:"flex",justifyContent:"space-between",marginBottom:3}}>
@@ -950,8 +1112,8 @@ export default function ApexBrain(){
 
 // ═══ COMPONENTS ═══
 const btnS={width:28,height:28,borderRadius:6,border:`1px solid #1e1e2e`,display:"flex",alignItems:"center",justifyContent:"center",cursor:"pointer",color:"#64748b",background:"transparent"};
-function Modal({title,onClose,children}){return(<div style={{position:"fixed",inset:0,background:"rgba(0,0,0,.7)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:100}}><div style={{background:"#12121a",border:"1px solid #1e1e2e",borderRadius:12,padding:16,width:"92%",maxWidth:400}}>
-  <div style={{display:"flex",justifyContent:"space-between",marginBottom:10}}><span style={{fontWeight:700,color:"#d4a843"}}>{title}</span><X size={16} color="#64748b" style={{cursor:"pointer"}} onClick={onClose}/></div>{children}</div></div>);}
+function Modal({title,onClose,children}){return(<div style={{position:"fixed",inset:0,background:"rgba(0,0,0,.7)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:100,padding:"10px"}}><div style={{background:"#12121a",border:"1px solid #1e1e2e",borderRadius:12,padding:16,width:"92%",maxWidth:400,maxHeight:"90vh",display:"flex",flexDirection:"column"}}>
+  <div style={{display:"flex",justifyContent:"space-between",marginBottom:10,flexShrink:0}}><span style={{fontWeight:700,color:"#d4a843"}}>{title}</span><X size={16} color="#64748b" style={{cursor:"pointer"}} onClick={onClose}/></div><div style={{overflowY:"auto",flex:1,minHeight:0}}>{children}</div></div></div>);}
 function Inp({p,v,c,t,full}){return<input placeholder={p} type={t||"text"} value={v} onChange={e=>c(e.target.value)} style={{padding:"7px 9px",background:"#12121a",border:"1px solid #1e1e2e",borderRadius:6,color:"#e2e8f0",fontSize:12,fontFamily:"'JetBrains Mono',monospace",outline:"none",...(full?{width:"100%",marginTop:6}:{})}}/>;}
 function Sel({v,c,opts}){return<select value={v} onChange={e=>c(e.target.value)} style={{padding:"7px 9px",background:"#12121a",border:"1px solid #1e1e2e",borderRadius:6,color:"#e2e8f0",fontSize:12,outline:"none"}}>{opts.map(([val,label])=><option key={val} value={val}>{label}</option>)}</select>;}
 function Btn({onClick,children}){return<button onClick={onClick} style={{width:"100%",marginTop:10,padding:9,background:"#d4a843",color:"#000",fontWeight:700,border:"none",borderRadius:8,cursor:"pointer",fontSize:12}}>{children}</button>;}
